@@ -10,7 +10,7 @@ My edge is patience and selectivity, not frequency or speed.
 
 ## Hard rules (non-negotiable — enforced in code)
 
-- Risk ≤ 0.5% of balance per trade.
+- Risk ≤ 1% of balance per trade.
 - Max 3 concurrent positions.
 - Max 5 new positions per day.
 - No weekend holds. Everything closed before 21:00 UTC Friday.
