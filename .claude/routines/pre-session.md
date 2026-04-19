@@ -27,7 +27,16 @@ If `hard_stop_hit: true` or `firm_violation: true`:
 python -m scripts.cli snapshot --note "pre-session"
 ```
 
-3. Read `memory/strategy.md` and `memory/playbook.md` — stay in character.
+3. Read `memory/strategy.md`, `memory/playbook.md`, **and `memory/performance.md`** — stay in character AND stay honest about what's been working.
+
+   ```bash
+   python -m scripts.cli stats --window 30       # recent cohort performance
+   ```
+
+   Pay attention to:
+   - Setups flagged ⚠️ auto-disabled — **do not trade these** until humans re-enable
+   - A vs B grade win rates — if A-grade win rate has collapsed, raise the rubric bar
+   - By-symbol totals — if a symbol is consistently negative, de-prioritize it this session
 
 4. Pick 3–5 tradeable symbols from the preflight `tradeable_symbols`.
    Avoid duplicating any instrument already in `positions` (run `python -m scripts.cli positions`).

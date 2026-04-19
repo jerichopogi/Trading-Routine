@@ -18,7 +18,7 @@ import os
 import sys
 from dataclasses import asdict
 
-from . import decide, journal, notify, research, sessions, trade
+from . import decide, journal, notify, research, sessions, stats, trade
 from .account import append_snapshot, snapshot
 from .broker import get_broker
 
@@ -137,6 +137,54 @@ def cmd_journal(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_stats(args: argparse.Namespace) -> int:
+    if args.write:
+        path = stats.write_performance_report()
+        print(f"Wrote {path}")
+        return 0
+    if args.json:
+        from dataclasses import asdict as _asdict
+        trades = stats.load_trades()
+        closed = [t for t in trades if t.is_closed]
+        out = {
+            "window_days": args.window,
+            "overall": _asdict(stats.cohort_of(closed)),
+            "by_setup": {k: _asdict(v) for k, v in stats.by_setup(closed).items()},
+            "by_grade": {k: _asdict(v) for k, v in stats.by_grade(closed).items()},
+            "by_symbol": {k: _asdict(v) for k, v in stats.by_symbol(closed).items()},
+            "auto_disable": [_asdict(f) for f in stats.auto_disable_flags(closed)],
+        }
+        print(json.dumps(out, indent=2, default=str))
+        return 0
+    print(stats.performance_markdown(window_days=args.window))
+    return 0
+
+
+def cmd_similar(args: argparse.Namespace) -> int:
+    from dataclasses import asdict as _asdict
+    trades = stats.load_trades()
+    matches = stats.similar_trades(
+        trades,
+        symbol=args.symbol,
+        setup=args.setup,
+        grade=args.grade,
+        limit=args.limit,
+    )
+    if args.json:
+        print(json.dumps([_asdict(t) for t in matches], indent=2, default=str))
+        return 0
+    if not matches:
+        print("(no matching trades)")
+        return 0
+    for t in matches:
+        r = f"{t.r_multiple:+.2f}R" if t.r_multiple is not None else "open"
+        print(
+            f"#{t.ticket} {t.symbol} {t.side} grade={t.grade} setup={t.setup} "
+            f"opened={t.opened_at.isoformat(timespec='minutes')} result={r}"
+        )
+    return 0
+
+
 def cmd_notify(args: argparse.Namespace) -> int:
     fn = {"info": notify.info, "warn": notify.warn, "error": notify.error, "success": notify.success}[args.level]
     ok = fn(args.title, args.body)
@@ -181,6 +229,20 @@ def build_parser() -> argparse.ArgumentParser:
     jr.add_argument("--section", required=True)
     jr.add_argument("--body", required=True)
     jr.set_defaults(func=cmd_journal)
+
+    st = sub.add_parser("stats", help="Performance snapshot from trade-log.jsonl")
+    st.add_argument("--window", type=int, default=30, help="Lookback window in days")
+    st.add_argument("--json", action="store_true")
+    st.add_argument("--write", action="store_true", help="Write memory/performance.md")
+    st.set_defaults(func=cmd_stats)
+
+    sm = sub.add_parser("similar", help="Find similar past trades")
+    sm.add_argument("--symbol")
+    sm.add_argument("--setup")
+    sm.add_argument("--grade", choices=["A", "B", "?"])
+    sm.add_argument("--limit", type=int, default=10)
+    sm.add_argument("--json", action="store_true")
+    sm.set_defaults(func=cmd_similar)
 
     nt = sub.add_parser("notify")
     nt.add_argument("--level", choices=["info", "success", "warn", "error"], default="info")

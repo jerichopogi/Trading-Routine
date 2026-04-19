@@ -29,6 +29,13 @@ python -m scripts.cli snapshot --note "session-open"
 4. For each idea:
    - Check current bid/ask via `python -m scripts.cli positions --json` has no conflicting position
    - Confirm the entry condition from the journal is still valid (price, catalyst timing)
+   - **Query similar past trades** — this is the feedback loop:
+     ```bash
+     python -m scripts.cli similar --symbol EURUSD --setup london-breakout --limit 10
+     ```
+     If the last 10 instances of this setup-symbol pair have a losing cohort
+     (Avg R negative AND win rate < 40%), demote the grade by one tier OR skip.
+     Journal this reasoning explicitly.
    - **Grade the setup with the rubric** (see `memory/playbook.md` — 5 checks):
      1. Matches a playbook setup? (required)
      2. HTF trend aligned?

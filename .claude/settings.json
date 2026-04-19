@@ -12,6 +12,8 @@
       "Bash(python -m scripts.cli research*)",
       "Bash(python -m scripts.cli journal*)",
       "Bash(python -m scripts.cli notify*)",
+      "Bash(python -m scripts.cli stats*)",
+      "Bash(python -m scripts.cli similar*)",
       "Bash(pytest*)",
       "Read",
       "Grep",

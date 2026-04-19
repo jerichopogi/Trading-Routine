@@ -19,6 +19,11 @@
 ```bash
 python -m scripts.cli snapshot --note "weekly close"
 python -m scripts.cli positions --json      # verify no open positions (Friday flatten already ran)
+
+# Regenerate the performance report — this is what next week's routines will read.
+python -m scripts.cli stats --write
+python -m scripts.cli stats --window 7       # display last-7-day snapshot for this review
+python -m scripts.cli stats --window 30      # display 30d context
 ```
 
 Read trade log for the last 7 days (filter by ts). Compute:
@@ -40,9 +45,14 @@ Grade:
 - **D**: rule violation OR −3R+ week
 - **F**: hard-stop hit OR multiple rule violations
 
-Propose edits:
-- Write any suggested `strategy.md` or `playbook.md` changes to a `section: "proposed edits"`
-  block in the weekly review file. Do NOT edit those files in this routine — humans apply.
+Propose edits (humans apply):
+- Write suggested `strategy.md` or `playbook.md` changes to a `section: "proposed edits"`
+  block in the weekly review file. Do NOT edit those files in this routine.
+- **Use the stats output to back every proposal with numbers.** Examples:
+  - "Pause `gold-pullback` — 0/6 winners, avg R −0.8 over 30d"
+  - "Tighten R:R threshold in rubric from 2.0 → 2.5 — A-grade win rate fell to 45%"
+  - "Drop NAS100 from the whitelist for now — consistently negative across all setups"
+- Anything in the stats `auto_disable` list should appear as a proposal, not silently applied.
 
 Discord:
 ```bash
