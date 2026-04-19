@@ -12,6 +12,7 @@ from dataclasses import asdict, is_dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 
+from . import clock
 from .broker import OrderRequest, OrderResult, Position
 
 
@@ -27,13 +28,17 @@ def _trade_log_path() -> Path:
 
 
 def _daily_journal_path(d: date | None = None) -> Path:
-    d = d or datetime.now(UTC).date()
+    # Use display-timezone "trading date" so the journal file matches the
+    # user's mental calendar (NY date by default).
+    d = d or clock.trading_date()
     return memory_dir() / "daily-journal" / f"{d.isoformat()}.md"
 
 
 def _weekly_review_path(iso_year: int | None = None, iso_week: int | None = None) -> Path:
-    now = datetime.now(UTC)
-    y, w = (iso_year, iso_week) if iso_year and iso_week else (now.isocalendar()[0], now.isocalendar()[1])
+    if iso_year and iso_week:
+        y, w = iso_year, iso_week
+    else:
+        y, w = clock.trading_iso_week()
     return memory_dir() / "weekly-reviews" / f"{y}-W{w:02d}.md"
 
 
@@ -101,11 +106,18 @@ def log_close(position: Position, ok: bool, reason: str, stage: str) -> None:
 # ----- human-readable markdown journals -----
 
 def append_daily_note(section: str, body: str, d: date | None = None) -> Path:
-    """Append a section to today's daily journal. Creates the file if missing."""
+    """Append a section to today's daily journal. Creates the file if missing.
+
+    Uses display-tz date (NY by default) for filename and header; each block
+    records both UTC and display-tz timestamps so history is unambiguous.
+    """
     path = _daily_journal_path(d)
     path.parent.mkdir(parents=True, exist_ok=True)
-    header = f"# {(d or datetime.now(UTC).date()).isoformat()}\n\n" if not path.exists() else ""
-    block = f"\n## {section}\n_{datetime.now(UTC).isoformat(timespec='seconds')}_\n\n{body}\n"
+    trading_day = (d or clock.trading_date()).isoformat()
+    header = f"# {trading_day}\n\n" if not path.exists() else ""
+    now_utc = datetime.now(UTC)
+    ts = f"{now_utc.isoformat(timespec='seconds')} ({clock.format_display(now_utc, '%H:%M %Z')})"
+    block = f"\n## {section}\n_{ts}_\n\n{body}\n"
     with path.open("a", encoding="utf-8") as f:
         f.write(header + block)
     return path
@@ -114,9 +126,11 @@ def append_daily_note(section: str, body: str, d: date | None = None) -> Path:
 def append_weekly_note(section: str, body: str) -> Path:
     path = _weekly_review_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    now = datetime.now(UTC)
-    header = f"# {now.isocalendar()[0]}-W{now.isocalendar()[1]:02d}\n\n" if not path.exists() else ""
-    block = f"\n## {section}\n_{now.isoformat(timespec='seconds')}_\n\n{body}\n"
+    y, w = clock.trading_iso_week()
+    header = f"# {y}-W{w:02d}\n\n" if not path.exists() else ""
+    now_utc = datetime.now(UTC)
+    ts = f"{now_utc.isoformat(timespec='seconds')} ({clock.format_display(now_utc, '%H:%M %Z')})"
+    block = f"\n## {section}\n_{ts}_\n\n{body}\n"
     with path.open("a", encoding="utf-8") as f:
         f.write(header + block)
     return path

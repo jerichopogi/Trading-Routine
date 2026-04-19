@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import os
+from datetime import UTC, datetime
 from typing import Literal
 
 import httpx
+
+from . import clock
 
 Severity = Literal["info", "warn", "error", "success"]
 
@@ -24,16 +27,20 @@ def _webhook_url() -> str | None:
 
 def _send(title: str, body: str, severity: Severity) -> bool:
     url = _webhook_url()
+    now_utc = datetime.now(UTC)
+    tz_stamp = clock.format_display(now_utc, "%Y-%m-%d %H:%M %Z")
     if not url:
         # No webhook configured — just print so humans running locally see it.
         # This is a silent-ok: absence of webhook is not a failure.
-        print(f"[notify:{severity}] {title}\n{body}")
+        print(f"[notify:{severity}] [{tz_stamp}] {title}\n{body}")
         return True
     payload = {
         "embeds": [{
             "title": title[:256],
             "description": body[:4000],
             "color": _COLORS[severity],
+            "footer": {"text": tz_stamp},
+            "timestamp": now_utc.isoformat(),
         }],
         "username": "TradingAgent",
     }

@@ -11,13 +11,26 @@ MT5 + FundedNext with session-aware scheduling and prop-firm kill-switches.
 
 ## What it does
 
-| Routine        | When (UTC)                  | Job |
-|----------------|-----------------------------|-----|
-| Pre-session    | Weekdays 06:45 and 13:00    | Research catalysts, draft trade ideas to today's journal |
-| Session-open   | Weekdays 07:05 and 13:35    | Execute drafted ideas through guarded trade path |
-| Midday         | Weekdays 17:00              | Cut losers, move stops to breakeven, trail winners |
-| Session-close  | Weekdays 21:00              | Flatten intraday positions (Fri: flatten ALL), journal |
-| Weekly review  | Friday 22:00                | Grade the week A–F, propose playbook edits, Discord-ping report |
+### Routine schedule
+
+Storage + cron times are in UTC. Display timezone is configurable (default
+`America/New_York`). Times shown below also include NY and Manila equivalents.
+
+| Routine        | UTC           | New York (ET)   | Manila (PHT)    | Job |
+|----------------|---------------|-----------------|-----------------|-----|
+| Pre-session 1  | Mon–Fri 06:45 | 02:45 EDT       | 14:45 PHT       | Research FX/gold — London pre-open |
+| Session-open 1 | Mon–Fri 07:05 | 03:05 EDT       | 15:05 PHT       | Execute London-session ideas |
+| Pre-session 2  | Mon–Fri 13:00 | 09:00 EDT       | 21:00 PHT       | Research indices — NY pre-open |
+| Session-open 2 | Mon–Fri 13:35 | 09:35 EDT       | 21:35 PHT       | Execute NY-session ideas |
+| Midday         | Mon–Fri 17:00 | 13:00 EDT       | 01:00 PHT (+1)  | Cut losers, trail winners |
+| Session-close  | Mon–Fri 21:00 | 17:00 EDT       | 05:00 PHT (+1)  | Flatten intraday (Fri: flatten all), journal |
+| Weekly review  | Fri 22:00     | Fri 18:00 EDT   | Sat 06:00 PHT   | A–F grading, playbook proposals |
+
+_NY times use EDT (summer). Winter is EST — everything shifts 1 hour earlier in NY/ET._
+_Manila (PHT, UTC+8) does not observe DST._
+
+Set `DISPLAY_TIMEZONE` in `.env` to control what you see in Discord pings and
+daily journal filenames. Internal timestamps stay UTC for DST safety.
 
 All order placement passes through `scripts/guardrails.py`, which enforces
 every FundedNext rule in code — the LLM cannot bypass it.

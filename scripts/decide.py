@@ -80,7 +80,10 @@ class PreflightReport:
     tradeable_symbols: list[str]
 
     def summary(self) -> str:
+        from . import clock
+        now_utc = datetime.now(UTC)
         lines = [
+            f"[{clock.format_display(now_utc, '%Y-%m-%d %H:%M %Z')} / {now_utc.strftime('%H:%M UTC')}]",
             f"stage={self.stage} server={self.server}",
             f"balance=${self.balance:,.2f} equity=${self.equity:,.2f}",
             f"daily_dd={self.daily_dd_pct:.2f}%  max_dd={self.max_dd_pct:.2f}%",
