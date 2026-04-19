@@ -1,0 +1,56 @@
+# FundedNext Stellar 2-step — rule parameters.
+#
+# VERIFY these numbers against fundednext.com before first live money.
+# Prop firm rules drift. Last confirmed: not yet verified — placeholders.
+#
+# "hard_stop" values are tighter than the firm limit so we never touch the wall.
+
+account:
+  initial_balance: 50000        # override in .env via INITIAL_BALANCE if different
+  currency: USD
+
+drawdown:
+  # Daily: measured from start-of-day equity (defined below).
+  daily_loss_limit_pct: 5.0
+  daily_loss_hard_stop_pct: 4.0
+  # Max overall: measured from initial balance, high-water-mark NOT used by FundedNext Stellar.
+  max_drawdown_pct: 10.0
+  max_drawdown_hard_stop_pct: 8.0
+  # Start-of-day equity: FundedNext Stellar resets daily loss at 00:00 server time.
+  start_of_day_utc_hour: 22      # MT5 broker server is typically GMT+2/+3 → 22:00 UTC ≈ midnight server
+
+risk:
+  per_trade_risk_pct: 0.5
+  max_concurrent_positions: 3
+  max_new_positions_per_day: 5
+  # Consistency rule (funded phase): no single day / single trade over this share of cumulative profit.
+  consistency_max_single_trade_pct: 30.0
+
+sessions:
+  no_weekend_hold: true
+  flatten_friday_utc: "21:00"    # close everything by this time on Fridays
+  # Optional news blackout windows (±minutes around red-folder events).
+  news_blackout_minutes: 5
+  news_trading_allowed: false    # we disable by default; flip on manually if FundedNext allows for your plan
+
+instruments:
+  whitelist:
+    - EURUSD
+    - GBPUSD
+    - USDJPY
+    - USDCHF
+    - AUDUSD
+    - USDCAD
+    - NZDUSD
+    - US30
+    - NAS100
+    - SPX500
+    - GER40
+    - XAUUSD
+    - XAGUSD
+  # Optional per-instrument overrides (e.g., tighter risk on volatile symbols).
+  overrides:
+    XAUUSD:
+      per_trade_risk_pct: 0.4
+    NAS100:
+      per_trade_risk_pct: 0.4

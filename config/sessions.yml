@@ -1,0 +1,31 @@
+# Market session definitions in UTC. Used by scripts/sessions.py to answer
+# "is this instrument currently tradeable?" and "when should we flatten?"
+#
+# days: 0=Mon .. 6=Sun
+# open/close: HH:MM UTC. Sessions that span midnight use two entries.
+
+sessions:
+  fx_24_5:
+    description: "FX — opens Sunday 22:00 UTC, closes Friday 21:00 UTC"
+    segments:
+      - { days: [6],             open: "22:00", close: "23:59" }  # Sun night
+      - { days: [0, 1, 2, 3],    open: "00:00", close: "23:59" }  # Mon–Thu full
+      - { days: [4],             open: "00:00", close: "21:00" }  # Fri until NY close
+
+  metals_23_5:
+    description: "Gold/Silver — ~23h/day, closes 21:00–22:00 UTC daily"
+    segments:
+      - { days: [6],             open: "22:00", close: "23:59" }
+      - { days: [0, 1, 2, 3],    open: "00:00", close: "21:00" }
+      - { days: [0, 1, 2, 3],    open: "22:00", close: "23:59" }
+      - { days: [4],             open: "00:00", close: "21:00" }
+
+  us_index:
+    description: "US indices — cash session 13:30–20:00 UTC (broker hours may extend)"
+    segments:
+      - { days: [0, 1, 2, 3, 4], open: "13:30", close: "20:00" }
+
+  eu_index:
+    description: "GER40 / EU indices — cash session 07:00–15:30 UTC"
+    segments:
+      - { days: [0, 1, 2, 3, 4], open: "07:00", close: "15:30" }

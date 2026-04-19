@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "model": "claude-opus-4-7",
+  "permissions": {
+    "allow": [
+      "Bash(python -m scripts.cli preflight*)",
+      "Bash(python -m scripts.cli snapshot*)",
+      "Bash(python -m scripts.cli positions*)",
+      "Bash(python -m scripts.cli flatten*)",
+      "Bash(python -m scripts.cli breakeven*)",
+      "Bash(python -m scripts.cli session-status*)",
+      "Bash(python -m scripts.cli research*)",
+      "Bash(python -m scripts.cli journal*)",
+      "Bash(python -m scripts.cli notify*)",
+      "Bash(pytest*)",
+      "Read",
+      "Grep",
+      "Glob",
+      "Edit(memory/**)",
+      "Write(memory/**)"
+    ],
+    "deny": [
+      "Bash(rm -rf*)",
+      "Bash(git push --force*)",
+      "Bash(python -m scripts.promote*)",
+      "Write(.env)",
+      "Write(config/fundednext.yml)"
+    ]
+  }
+}

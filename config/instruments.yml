@@ -1,0 +1,122 @@
+# Instrument metadata. Contract size / pip value / digits must be verified against
+# the actual FundedNext MT5 symbol on the Windows terminal — naming and spec can
+# differ (e.g. EURUSD.r, EURUSDm). Fill in the real symbol name in `mt5_symbol`
+# once you can see the Market Watch on the Windows box.
+
+instruments:
+  EURUSD:
+    mt5_symbol: EURUSD           # <- override on Windows if broker uses suffix
+    asset_class: fx
+    digits: 5
+    point: 0.00001
+    pip: 0.0001
+    contract_size: 100000
+    session: fx_24_5
+
+  GBPUSD:
+    mt5_symbol: GBPUSD
+    asset_class: fx
+    digits: 5
+    point: 0.00001
+    pip: 0.0001
+    contract_size: 100000
+    session: fx_24_5
+
+  USDJPY:
+    mt5_symbol: USDJPY
+    asset_class: fx
+    digits: 3
+    point: 0.001
+    pip: 0.01
+    contract_size: 100000
+    session: fx_24_5
+
+  USDCHF:
+    mt5_symbol: USDCHF
+    asset_class: fx
+    digits: 5
+    point: 0.00001
+    pip: 0.0001
+    contract_size: 100000
+    session: fx_24_5
+
+  AUDUSD:
+    mt5_symbol: AUDUSD
+    asset_class: fx
+    digits: 5
+    point: 0.00001
+    pip: 0.0001
+    contract_size: 100000
+    session: fx_24_5
+
+  USDCAD:
+    mt5_symbol: USDCAD
+    asset_class: fx
+    digits: 5
+    point: 0.00001
+    pip: 0.0001
+    contract_size: 100000
+    session: fx_24_5
+
+  NZDUSD:
+    mt5_symbol: NZDUSD
+    asset_class: fx
+    digits: 5
+    point: 0.00001
+    pip: 0.0001
+    contract_size: 100000
+    session: fx_24_5
+
+  XAUUSD:
+    mt5_symbol: XAUUSD
+    asset_class: metal
+    digits: 2
+    point: 0.01
+    pip: 0.1
+    contract_size: 100
+    session: metals_23_5
+
+  XAGUSD:
+    mt5_symbol: XAGUSD
+    asset_class: metal
+    digits: 3
+    point: 0.001
+    pip: 0.01
+    contract_size: 5000
+    session: metals_23_5
+
+  US30:
+    mt5_symbol: US30
+    asset_class: index
+    digits: 2
+    point: 0.01
+    pip: 1.0
+    contract_size: 1
+    session: us_index
+
+  NAS100:
+    mt5_symbol: NAS100
+    asset_class: index
+    digits: 2
+    point: 0.01
+    pip: 1.0
+    contract_size: 1
+    session: us_index
+
+  SPX500:
+    mt5_symbol: SPX500
+    asset_class: index
+    digits: 2
+    point: 0.01
+    pip: 0.1
+    contract_size: 1
+    session: us_index
+
+  GER40:
+    mt5_symbol: GER40
+    asset_class: index
+    digits: 2
+    point: 0.01
+    pip: 1.0
+    contract_size: 1
+    session: eu_index
