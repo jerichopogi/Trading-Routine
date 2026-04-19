@@ -57,10 +57,48 @@ _Disabled on prop accounts: fills and spread widening make this unreliable. Do n
 
 ---
 
-## Trade sizing
+## Trade sizing — conviction based
 
-All setups use `decide.draft_order()` which calls `size_by_risk()` with the
-configured per-trade risk %. Never override the computed lot size.
+Every trade is graded A or B. The grade drives risk %, and the LLM records
+the rubric in the daily journal for later analysis.
+
+### Grading rubric (from strategy.md)
+
+Score 1 point per item true at intended entry:
+
+1. **Matches a specific playbook setup** ← required; if 0, do not trade
+2. **HTF trend aligned** with direction (H4 for intraday, D1 for swing)
+3. **Clear of red-folder news** for next 60 min
+4. **R:R ≥ 2.0** at planned entry/stop/target
+5. **At a meaningful level** (prior HH/LL, key MA, untouched supply/demand)
+
+- **5/5 → A-grade: 1.0% risk** (0.8% on XAU/NAS)
+- **≤ 4/5 → B-grade: 0.5% risk** (0.4% on XAU/NAS)
+- **Fails #1 → skip entirely**
+
+### How to size in code
+
+```python
+from scripts.decide import draft_order, ConvictionGrade, SetupRubric
+
+rubric = SetupRubric(
+    matches_playbook=True,
+    htf_trend_aligned=True,
+    clear_of_news=True,
+    rr_ratio_ok=True,
+    at_meaningful_level=True,
+)
+grade = rubric.grade   # A if 5/5, else B
+
+order = draft_order(
+    symbol="EURUSD", side=OrderSide.BUY,
+    entry=1.0750, stop=1.0720, target=1.0810,
+    broker=b, grade=grade, comment="London breakout",
+)
+# Guardrail still enforces 1.0% ceiling (0.8% on XAU/NAS) — unbreakable.
+```
+
+Never override the computed lot size. The computation is the rule.
 
 ## Comment tagging
 

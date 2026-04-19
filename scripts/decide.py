@@ -2,17 +2,67 @@
 
 These are thin, deterministic helpers. The *decisions* happen inside the
 routine prompt (Claude's judgment); this module just packages state.
+
+Conviction-based sizing
+-----------------------
+`draft_order(grade=...)` sizes the trade based on setup quality:
+
+- Grade A ("very good" — 5/5 on rubric): up to `per_trade_risk_pct_max` (1% default)
+- Grade B ("okay" — meets playbook criteria): `per_trade_risk_pct` (0.5% default)
+
+Rubric (see playbook.md for details) — scored by the LLM in the routine:
+  1. Matches a specific playbook setup
+  2. Higher-timeframe trend aligned with the trade direction
+  3. No red-folder news within 1 hour of entry
+  4. R:R at entry ≥ 2.0
+  5. Price at a meaningful level (prior HH/LL, key MA, untouched supply/demand)
+
+5/5 → A.  4 or fewer → B.  (No grading below B — if it can't hit 4/5, skip it.)
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
 
 from . import sessions as session_clock
 from .account import compute_rule_status, read_equity_curve
 from .broker import Broker, OrderRequest, OrderSide
 from .config import fundednext, instruments
+
+
+class ConvictionGrade(StrEnum):
+    A = "A"   # very good — max risk
+    B = "B"   # standard — default risk
+
+
+@dataclass(frozen=True)
+class SetupRubric:
+    """Checklist the LLM fills in to grade a setup. Must all be True for A-grade."""
+    matches_playbook: bool
+    htf_trend_aligned: bool
+    clear_of_news: bool
+    rr_ratio_ok: bool       # R:R ≥ 2.0 at intended entry
+    at_meaningful_level: bool
+
+    @property
+    def score(self) -> int:
+        return sum([
+            self.matches_playbook,
+            self.htf_trend_aligned,
+            self.clear_of_news,
+            self.rr_ratio_ok,
+            self.at_meaningful_level,
+        ])
+
+    @property
+    def grade(self) -> ConvictionGrade:
+        if not self.matches_playbook:
+            # Hard requirement — no playbook match, no trade (and certainly not A).
+            return ConvictionGrade.B
+        return ConvictionGrade.A if self.score == 5 else ConvictionGrade.B
 
 
 @dataclass(frozen=True)
@@ -83,13 +133,31 @@ def size_by_risk(
     risk_pct: float,
     contract_size: float,
 ) -> float:
-    """Return volume in lots so loss at stop equals `risk_pct` of balance."""
+    """Return volume in lots so loss at stop is at most `risk_pct` of balance.
+
+    Rounds DOWN to 2 decimals (MT5 standard lot step). Rounding down ensures
+    we never exceed the configured ceiling due to lot-size quantization.
+    """
     distance = abs(entry - stop)
     if distance == 0 or contract_size == 0:
         return 0.0
     dollars_to_risk = balance * (risk_pct / 100.0)
     lots = dollars_to_risk / (distance * contract_size)
-    return round(lots, 2)
+    # Floor to 2 decimals — stays at or under the ceiling.
+    return math.floor(lots * 100) / 100
+
+
+def risk_pct_for(symbol: str, grade: ConvictionGrade) -> float:
+    """The per-trade risk % this symbol uses at the given conviction grade."""
+    cfg = fundednext()
+    overrides = cfg["instruments"].get("overrides", {}).get(symbol, {})
+    if grade == ConvictionGrade.A:
+        return float(
+            overrides.get("per_trade_risk_pct_max", cfg["risk"]["per_trade_risk_pct_max"])
+        )
+    return float(
+        overrides.get("per_trade_risk_pct", cfg["risk"]["per_trade_risk_pct"])
+    )
 
 
 def draft_order(
@@ -100,14 +168,18 @@ def draft_order(
     stop: float,
     target: float,
     broker: Broker,
+    grade: ConvictionGrade = ConvictionGrade.B,
     comment: str = "",
 ) -> OrderRequest:
-    """Compose an OrderRequest with volume sized to per-trade risk config."""
-    cfg = fundednext()
-    risk_pct = float(cfg["risk"]["per_trade_risk_pct"])
-    overrides = cfg["instruments"].get("overrides", {})
-    if symbol in overrides and "per_trade_risk_pct" in overrides[symbol]:
-        risk_pct = float(overrides[symbol]["per_trade_risk_pct"])
+    """Compose an OrderRequest with volume sized to per-trade risk config.
+
+    `grade` picks which risk % to use:
+      - A ("very good" setup — 5/5 rubric): up to per_trade_risk_pct_max
+      - B ("okay" setup, default): per_trade_risk_pct
+
+    The guardrail layer still enforces the MAX as a hard ceiling regardless.
+    """
+    risk_pct = risk_pct_for(symbol, grade)
     info = broker.account_info()
     sym = broker.symbol_info(symbol)
     volume = size_by_risk(
@@ -115,7 +187,9 @@ def draft_order(
         balance=info.balance, risk_pct=risk_pct,
         contract_size=sym.contract_size,
     )
+    # Tag the comment with the grade so we can analyze performance by conviction later.
+    graded_comment = f"{comment}|{grade.value}"[:31] if comment else f"grade:{grade.value}"
     return OrderRequest(
         symbol=symbol, side=side, volume=volume,
-        sl=stop, tp=target, comment=comment[:31],
+        sl=stop, tp=target, comment=graded_comment,
     )

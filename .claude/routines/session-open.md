@@ -29,24 +29,41 @@ python -m scripts.cli snapshot --note "session-open"
 4. For each idea:
    - Check current bid/ask via `python -m scripts.cli positions --json` has no conflicting position
    - Confirm the entry condition from the journal is still valid (price, catalyst timing)
+   - **Grade the setup with the rubric** (see `memory/playbook.md` — 5 checks):
+     1. Matches a playbook setup? (required)
+     2. HTF trend aligned?
+     3. Clear of red-folder news (next 60 min)?
+     4. R:R ≥ 2.0?
+     5. At a meaningful level?
+     → 5/5 = A-grade (up to 1%). Anything less = B-grade (0.5%).
+     Fails #1 = skip.
    - Execute with a short Python one-liner that goes through the guarded trade path:
      ```bash
      python -c "
      import os
      from dotenv import load_dotenv; load_dotenv()
      from scripts.broker import get_broker, OrderSide
-     from scripts import decide, trade
+     from scripts.decide import ConvictionGrade, SetupRubric, draft_order
+     from scripts import trade
      b = get_broker(); b.connect()
-     order = decide.draft_order(
+     rubric = SetupRubric(
+         matches_playbook=True,
+         htf_trend_aligned=True,
+         clear_of_news=True,
+         rr_ratio_ok=True,
+         at_meaningful_level=False,   # ← fill in honestly for each trade
+     )
+     order = draft_order(
          symbol='EURUSD', side=OrderSide.BUY,
          entry=1.0750, stop=1.0720, target=1.0810,
-         broker=b, comment='London breakout',
+         broker=b, grade=rubric.grade, comment='London breakout',
      )
      outcome = trade.place(order, b, stage=os.environ['TRADING_STAGE'])
      print(outcome)
      b.disconnect()
      "
      ```
+   - Journal the rubric for EVERY trade placed so weekly review can analyze A vs B performance.
    - The `trade.place` call runs the full guardrail battery; any violation returns a
      rejection with reasons. Do NOT bypass it.
 

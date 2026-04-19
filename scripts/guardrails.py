@@ -34,9 +34,19 @@ class GuardrailVerdict:
         return not self.ok
 
 
-def _risk_pct_for(symbol: str, cfg_risk: dict, overrides: dict) -> float:
+def _risk_pct_ceiling_for(symbol: str, cfg_risk: dict, overrides: dict) -> float:
+    """The MAX per-trade risk this symbol allows (A-grade ceiling).
+
+    Guardrails enforce the ceiling, not the default — so the LLM can pick A vs B
+    conviction sizing without the guardrail blocking A-grade trades.
+    """
     override = overrides.get(symbol, {})
-    return float(override.get("per_trade_risk_pct", cfg_risk["per_trade_risk_pct"]))
+    return float(
+        override.get(
+            "per_trade_risk_pct_max",
+            cfg_risk.get("per_trade_risk_pct_max", cfg_risk["per_trade_risk_pct"]),
+        )
+    )
 
 
 def _estimate_risk_dollars(
@@ -115,7 +125,7 @@ def check_or_reject(
         reasons.append(f"symbol_info: {e}")
         return GuardrailVerdict(ok=False, reasons=reasons, metadata=meta)
 
-    risk_pct_limit = _risk_pct_for(
+    risk_pct_limit = _risk_pct_ceiling_for(
         order.symbol, cfg["risk"], cfg["instruments"].get("overrides", {})
     )
     meta["risk_pct_limit"] = risk_pct_limit

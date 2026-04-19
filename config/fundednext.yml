@@ -20,7 +20,13 @@ drawdown:
   start_of_day_utc_hour: 22      # MT5 broker server is typically GMT+2/+3 → 22:00 UTC ≈ midnight server
 
 risk:
-  per_trade_risk_pct: 0.5
+  # Conviction-based sizing:
+  #   - B grade ("okay" setup — meets playbook criteria): default risk.
+  #   - A grade ("very good" setup — 5/5 on rubric in playbook.md): up to max risk.
+  # Guardrail rejects anything above per_trade_risk_pct_max. The LLM picks the
+  # grade in decide.draft_order() and sizes accordingly.
+  per_trade_risk_pct: 0.5        # default (B grade)
+  per_trade_risk_pct_max: 1.0    # ceiling (A grade) — hard cap enforced by guardrails
   max_concurrent_positions: 3
   max_new_positions_per_day: 5
   # Consistency rule (funded phase): no single day / single trade over this share of cumulative profit.
@@ -52,5 +58,7 @@ instruments:
   overrides:
     XAUUSD:
       per_trade_risk_pct: 0.4
+      per_trade_risk_pct_max: 0.8    # tighter ceiling on volatile metals
     NAS100:
       per_trade_risk_pct: 0.4
+      per_trade_risk_pct_max: 0.8    # tighter ceiling on tech index

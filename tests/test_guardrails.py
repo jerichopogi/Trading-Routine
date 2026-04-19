@@ -49,10 +49,46 @@ def test_missing_stop_loss_rejected(mock_broker: MockBroker) -> None:
 
 
 def test_excessive_per_trade_risk_rejected(mock_broker: MockBroker) -> None:
-    # 5 lots * 100000 * 0.003 = $1500 → 3% risk on $50k, way over 0.5%.
+    # 5 lots * 100000 * 0.003 = $1500 → 3% risk on $50k, way over 1% ceiling.
     order = OrderRequest(
         symbol="EURUSD", side=OrderSide.BUY, volume=5.0,
         sl=1.07200, tp=1.08000,
+    )
+    verdict = check_or_reject(order, broker=mock_broker, now=WED_10_UTC)
+    assert not verdict.ok
+    assert any("risk" in r.lower() for r in verdict.reasons)
+
+
+def test_a_grade_max_risk_within_ceiling_passes(mock_broker: MockBroker) -> None:
+    """1% risk on EURUSD (A-grade max) should be allowed — ceiling is 1%, not default 0.5%."""
+    # 1.66 lots * 100000 * 0.003 = $498 ≈ ~1% of $50k
+    order = OrderRequest(
+        symbol="EURUSD", side=OrderSide.BUY, volume=1.6,
+        sl=1.07200, tp=1.07800,
+    )
+    verdict = check_or_reject(order, broker=mock_broker, now=WED_10_UTC)
+    assert verdict.ok, verdict.reasons
+
+
+def test_a_grade_over_ceiling_rejected(mock_broker: MockBroker) -> None:
+    """1.1% risk is over the 1% ceiling — must reject."""
+    # 1.85 lots * 100000 * 0.003 = $555 ≈ 1.11% of $50k
+    order = OrderRequest(
+        symbol="EURUSD", side=OrderSide.BUY, volume=1.85,
+        sl=1.07200, tp=1.07800,
+    )
+    verdict = check_or_reject(order, broker=mock_broker, now=WED_10_UTC)
+    assert not verdict.ok
+    assert any("risk" in r.lower() for r in verdict.reasons)
+
+
+def test_xauusd_tighter_ceiling_rejects_1pct(mock_broker: MockBroker) -> None:
+    """XAUUSD ceiling is 0.8%, not 1%. A trade sized to 1% on XAU must reject."""
+    # Distance=10 (2300→2290), contract=100. 1% of $50k=$500 → vol = 0.5 lots
+    # That's 1% — over XAUUSD's 0.8% ceiling.
+    order = OrderRequest(
+        symbol="XAUUSD", side=OrderSide.BUY, volume=0.5,
+        sl=2290.00, tp=2320.00,
     )
     verdict = check_or_reject(order, broker=mock_broker, now=WED_10_UTC)
     assert not verdict.ok
