@@ -31,7 +31,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, time as dt_time, timedelta
 from pathlib import Path
 
-from .broker.base import Bar, OrderSide, Timeframe
+from .broker.base import Bar, OrderKind, OrderSide, Timeframe
 
 
 # ----------------------------- Data loading ---------------------------------
@@ -86,28 +86,30 @@ def load_mt5_history(symbol: str, tf: Timeframe, start: datetime, end: datetime)
 # --------------------------- Setup detection --------------------------------
 
 @dataclass(frozen=True)
-class BreakoutSignal:
-    """Detected London Breakout, ready to place as pending."""
-    signal_time: datetime          # bar that produced the break
+class Signal:
+    """Generic setup signal — both playbook setups produce this shape.
+
+    `entry_kind` controls how the pending order triggers:
+      - LIMIT: fills when price pulls BACK to entry (buy → ask <= entry)
+      - STOP:  fills when price BREAKS through entry (buy → ask >= entry)
+    """
+    setup: str                     # "london_breakout" | "ny_momentum"
+    signal_time: datetime
     side: OrderSide
-    entry: float                   # retest level (broken edge)
-    sl: float                      # Asian range midpoint
-    tp: float                      # 1.5× range from break point
-    asian_high: float
-    asian_low: float
-    break_close: float
+    entry_kind: OrderKind
+    entry: float
+    sl: float
+    tp: float
+
+
+# Kept as alias so any external callers importing BreakoutSignal don't break.
+BreakoutSignal = Signal
 
 
 def detect_london_breakout(
     day_bars: list[Bar], *, min_range_pips: float = 20.0, pip_size: float = 0.0001,
-) -> BreakoutSignal | None:
-    """Detect the London Breakout signal for bars belonging to a single UTC day.
-
-    Asian range = high/low of 00:00–07:00 UTC bars.
-    Break = first bar in 07:00–09:00 UTC that CLOSES outside the range.
-    Entry = the broken edge (retest); SL = Asian midpoint; TP = 1.5R from break.
-    Returns None if no break or range below min_range_pips.
-    """
+) -> Signal | None:
+    """Detect London Breakout per playbook #1: Asian range -> retest entry (LIMIT)."""
     asian = [b for b in day_bars if b.time.time() < dt_time(7, 0)]
     london = [
         b for b in day_bars
@@ -125,19 +127,66 @@ def detect_london_breakout(
 
     for bar in london:
         if bar.close > asian_high:
-            tp = bar.close + 1.5 * asian_range
-            return BreakoutSignal(
-                signal_time=bar.time, side=OrderSide.BUY,
-                entry=asian_high, sl=asian_mid, tp=tp,
-                asian_high=asian_high, asian_low=asian_low, break_close=bar.close,
+            return Signal(
+                setup="london_breakout", signal_time=bar.time, side=OrderSide.BUY,
+                entry_kind=OrderKind.LIMIT,
+                entry=asian_high, sl=asian_mid, tp=bar.close + 1.5 * asian_range,
             )
         if bar.close < asian_low:
-            tp = bar.close - 1.5 * asian_range
-            return BreakoutSignal(
-                signal_time=bar.time, side=OrderSide.SELL,
-                entry=asian_low, sl=asian_mid, tp=tp,
-                asian_high=asian_high, asian_low=asian_low, break_close=bar.close,
+            return Signal(
+                setup="london_breakout", signal_time=bar.time, side=OrderSide.SELL,
+                entry_kind=OrderKind.LIMIT,
+                entry=asian_low, sl=asian_mid, tp=bar.close - 1.5 * asian_range,
             )
+    return None
+
+
+def detect_ny_momentum(
+    day_bars: list[Bar], *, cash_open_hour: int = 13, cash_open_minute: int = 30,
+) -> Signal | None:
+    """Detect NY Open Momentum per playbook #2.
+
+    Pre-market range: high/low of bars 00:00 UTC up to cash open (13:30 UTC).
+    First cash bar: 13:30-13:45 UTC (M15). If its CLOSE is outside the
+    pre-market range, we wait for the NEXT bar to break its high (long)
+    or low (short) — a STOP entry.
+
+    SL: opposite side of first-15m bar (+/- 1 pip for noise).
+    TP: entry + 2 × first-15m-range (for long; mirror for short).
+
+    Returns a STOP-kind Signal or None.
+    """
+    cash_open = dt_time(cash_open_hour, cash_open_minute)
+    pre_market = [b for b in day_bars if b.time.time() < cash_open]
+    cash_bar = next(
+        (b for b in day_bars if b.time.time() == cash_open), None
+    )
+    if not pre_market or cash_bar is None:
+        return None
+
+    pm_high = max(b.high for b in pre_market)
+    pm_low = min(b.low for b in pre_market)
+    first_range = cash_bar.high - cash_bar.low
+    if first_range <= 0:
+        return None
+
+    if cash_bar.close > pm_high:
+        # Bull signal: entry = first-bar high (STOP), SL = first-bar low, TP = entry + 2 × range
+        return Signal(
+            setup="ny_momentum", signal_time=cash_bar.time, side=OrderSide.BUY,
+            entry_kind=OrderKind.STOP,
+            entry=cash_bar.high,
+            sl=cash_bar.low,
+            tp=cash_bar.high + 2.0 * first_range,
+        )
+    if cash_bar.close < pm_low:
+        return Signal(
+            setup="ny_momentum", signal_time=cash_bar.time, side=OrderSide.SELL,
+            entry_kind=OrderKind.STOP,
+            entry=cash_bar.low,
+            sl=cash_bar.high,
+            tp=cash_bar.low - 2.0 * first_range,
+        )
     return None
 
 
@@ -195,10 +244,24 @@ class BacktestConfig:
     trail_r_step: float = 1.0
 
 
+def _default_detector(day_bars: list[Bar], config: "BacktestConfig") -> Signal | None:
+    return detect_london_breakout(
+        day_bars, min_range_pips=config.min_asian_range_pips, pip_size=config.pip_size,
+    )
+
+
 def run_backtest(
     bars: list[Bar], *, config: BacktestConfig = BacktestConfig(),
+    detector=None,
 ) -> tuple[list[SimulatedTrade], list[tuple[datetime, float]]]:
-    """Walk M15 bars chronologically; return (trades, equity_curve_points)."""
+    """Walk M15 bars chronologically; return (trades, equity_curve_points).
+
+    `detector` is a callable `(day_bars, config) -> Signal | None`. Default:
+    London Breakout. Pass `detect_ny_momentum` (wrapped if needed) to run
+    the NY Open Momentum setup instead.
+    """
+    if detector is None:
+        detector = _default_detector
     if not bars:
         return [], []
 
@@ -238,13 +301,8 @@ def run_backtest(
             open_trade is None
             and pending is None
             and not day_already_traded
-            and bar.time.time() >= dt_time(7, 0)
         ):
-            sig = detect_london_breakout(
-                by_day[current_day],
-                min_range_pips=config.min_asian_range_pips,
-                pip_size=config.pip_size,
-            )
+            sig = detector(by_day[current_day], config)
             if sig is not None and bar.time >= sig.signal_time:
                 pending = sig
                 pending_placed_at = bar.time
@@ -339,11 +397,20 @@ def run_backtest(
 
         # --- pending trigger / expiry -------------------------------------
         if pending is not None and open_trade is None:
-            triggered = (
-                pending.side == OrderSide.BUY and bar.low <= pending.entry
-            ) or (
-                pending.side == OrderSide.SELL and bar.high >= pending.entry
-            )
+            # LIMIT: fills when price moves BACK to entry
+            # STOP:  fills when price BREAKS through entry going further
+            if pending.entry_kind == OrderKind.LIMIT:
+                triggered = (
+                    pending.side == OrderSide.BUY and bar.low <= pending.entry
+                ) or (
+                    pending.side == OrderSide.SELL and bar.high >= pending.entry
+                )
+            else:  # STOP
+                triggered = (
+                    pending.side == OrderSide.BUY and bar.high >= pending.entry
+                ) or (
+                    pending.side == OrderSide.SELL and bar.low <= pending.entry
+                )
             if triggered:
                 fill = (
                     pending.entry + spread
@@ -353,7 +420,7 @@ def run_backtest(
                 open_trade = SimulatedTrade(
                     symbol=config.symbol,
                     side=pending.side.value,
-                    setup="london_breakout",
+                    setup=pending.setup,
                     signal_time=pending.signal_time,
                     fill_time=bar.time,
                     close_time=None,
@@ -374,10 +441,9 @@ def run_backtest(
                 pending_placed_at is not None
                 and (bar.time - pending_placed_at) > timedelta(hours=config.pending_expire_hours)
             ):
-                # Log the expired signal as a non-filled record so stats can count skips
                 trades.append(SimulatedTrade(
                     symbol=config.symbol, side=pending.side.value,
-                    setup="london_breakout", signal_time=pending.signal_time,
+                    setup=pending.setup, signal_time=pending.signal_time,
                     fill_time=None, close_time=bar.time,
                     entry_planned=pending.entry, entry_fill=None,
                     sl=pending.sl, tp=pending.tp,
@@ -531,9 +597,10 @@ def compute_stats(
 # --------------------------------- Report -----------------------------------
 
 def format_report(stats: BacktestStats, trades: list[SimulatedTrade], config: BacktestConfig) -> str:
+    setup_name = trades[0].setup if trades else "?"
     lines = [
         "=" * 72,
-        f"  BACKTEST REPORT -- {config.symbol} London Breakout (Phase 1)",
+        f"  BACKTEST REPORT -- {config.symbol} / {setup_name}",
         "=" * 72,
         "",
         f"  Period:        {trades[0].signal_time.date() if trades else '-'}"
@@ -612,6 +679,15 @@ def main(argv: list[str] | None = None) -> int:
         "--no-manage-runners", action="store_true",
         help="Disable partial TPs + trailing SL (Phase 1 baseline behavior)",
     )
+    parser.add_argument(
+        "--setup", choices=["london_breakout", "ny_momentum"],
+        default="london_breakout",
+        help="Which playbook setup to backtest",
+    )
+    parser.add_argument(
+        "--pip-size", type=float,
+        help="Override pip size (default 0.0001 for FX, 1.0 for indices)",
+    )
     args = parser.parse_args(argv)
 
     start = datetime.fromisoformat(args.start).replace(tzinfo=UTC)
@@ -621,16 +697,27 @@ def main(argv: list[str] | None = None) -> int:
     bars = load_mt5_history(args.symbol, Timeframe.M15, start, end)
     print(f"[backtest] loaded {len(bars)} M15 bars", file=sys.stderr)
 
+    # Sensible pip defaults: indices use 1.0 (points), FX uses 0.0001.
+    default_pip = 1.0 if args.symbol in {"US30", "NAS100", "SPX500", "GER40"} else 0.0001
+    pip = args.pip_size if args.pip_size is not None else default_pip
+
     config = BacktestConfig(
         symbol=args.symbol,
         initial_balance=args.balance,
         risk_pct=args.risk_pct,
         min_asian_range_pips=args.min_range_pips,
+        pip_size=pip,
         enable_manage_runners=not args.no_manage_runners,
     )
 
-    print("[backtest] running simulation...", file=sys.stderr)
-    trades, equity_curve = run_backtest(bars, config=config)
+    if args.setup == "london_breakout":
+        detector = _default_detector
+    else:
+        def detector(day_bars, cfg):
+            return detect_ny_momentum(day_bars)
+
+    print(f"[backtest] running simulation (setup={args.setup})...", file=sys.stderr)
+    trades, equity_curve = run_backtest(bars, config=config, detector=detector)
     stats = compute_stats(trades, equity_curve, config)
 
     if args.json:

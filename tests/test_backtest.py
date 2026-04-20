@@ -8,12 +8,13 @@ import pytest
 
 from scripts.backtest import (
     BacktestConfig,
-    BreakoutSignal,
+    Signal,
     compute_stats,
     detect_london_breakout,
+    detect_ny_momentum,
     run_backtest,
 )
-from scripts.broker.base import Bar, OrderSide
+from scripts.broker.base import Bar, OrderKind, OrderSide
 
 
 # ---------- helpers ----------
@@ -207,6 +208,84 @@ def test_manage_runners_2r_partial_on_winner() -> None:
     t = filled[0]
     assert t.did_partial_2r  # must take 2R partial on the way up
     assert t.r_multiple is not None and t.r_multiple > 2.0
+
+
+# ---------- detect_ny_momentum ----------
+
+
+def test_ny_momentum_bull_signal() -> None:
+    """NAS100 first cash-open bar closes above pre-market high → STOP BUY at its high."""
+    day = datetime(2026, 4, 22, 0, 0, tzinfo=UTC)
+    m15 = timedelta(minutes=15)
+    bars: list[Bar] = []
+    # Pre-market bars 00:00 - 13:30 (54 bars of 15min). Range: 17400-17500.
+    for i in range(54):
+        bars.append(_bar(day + m15 * i, 17450, 17500, 17400, 17470))
+    # First cash bar 13:30-13:45: opens 17480, makes new high 17560, closes 17550 (above pm_high 17500)
+    bars.append(_bar(day + m15 * 54, 17480, 17560, 17470, 17550))
+
+    sig = detect_ny_momentum(bars)
+    assert sig is not None
+    assert sig.setup == "ny_momentum"
+    assert sig.side == OrderSide.BUY
+    assert sig.entry_kind == OrderKind.STOP
+    assert sig.entry == 17560  # cash bar high
+    assert sig.sl == 17470     # cash bar low
+    # TP = entry + 2 × first_range (90 pts)
+    assert sig.tp == pytest.approx(17560 + 2 * 90, abs=1e-6)
+
+
+def test_ny_momentum_bear_signal() -> None:
+    day = datetime(2026, 4, 22, 0, 0, tzinfo=UTC)
+    m15 = timedelta(minutes=15)
+    bars: list[Bar] = []
+    for i in range(54):
+        bars.append(_bar(day + m15 * i, 17450, 17500, 17400, 17470))
+    # Cash bar: opens 17420, drops to 17340, closes 17350 (below pm_low 17400)
+    bars.append(_bar(day + m15 * 54, 17420, 17430, 17340, 17350))
+
+    sig = detect_ny_momentum(bars)
+    assert sig is not None
+    assert sig.side == OrderSide.SELL
+    assert sig.entry_kind == OrderKind.STOP
+    assert sig.entry == 17340
+
+
+def test_ny_momentum_no_signal_when_close_inside_range() -> None:
+    day = datetime(2026, 4, 22, 0, 0, tzinfo=UTC)
+    m15 = timedelta(minutes=15)
+    bars: list[Bar] = []
+    for i in range(54):
+        bars.append(_bar(day + m15 * i, 17450, 17500, 17400, 17470))
+    # Cash bar close stays inside range
+    bars.append(_bar(day + m15 * 54, 17480, 17495, 17475, 17485))
+    assert detect_ny_momentum(bars) is None
+
+
+def test_simulator_with_ny_momentum_detector() -> None:
+    """End-to-end: NY momentum bull signal → STOP order fills on breakout bar."""
+    day = datetime(2026, 4, 22, 0, 0, tzinfo=UTC)
+    m15 = timedelta(minutes=15)
+    bars: list[Bar] = []
+    for i in range(54):
+        bars.append(_bar(day + m15 * i, 17450, 17500, 17400, 17470))
+    # Cash bar: closes above pm_high → STOP BUY at 17560
+    bars.append(_bar(day + m15 * 54, 17480, 17560, 17470, 17550))
+    # Next bar: breaks 17560 and runs up
+    bars.append(_bar(day + m15 * 55, 17555, 17620, 17550, 17600))
+    bars.append(_bar(day + m15 * 56, 17600, 17740, 17580, 17740))  # hits TP 17740
+
+    def detector(day_bars, cfg):
+        return detect_ny_momentum(day_bars)
+
+    config = BacktestConfig(symbol="NAS100", pip_size=1.0, enable_manage_runners=False)
+    trades, _ = run_backtest(bars, config=config, detector=detector)
+    filled = [t for t in trades if t.entry_fill is not None]
+    assert len(filled) == 1
+    t = filled[0]
+    assert t.setup == "ny_momentum"
+    assert t.side == "buy"
+    assert t.exit_reason == "tp"
 
 
 def test_manage_runners_toggle_changes_result() -> None:
