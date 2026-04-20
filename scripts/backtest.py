@@ -1,0 +1,582 @@
+"""Backtest -- Phase 1: London Breakout on EURUSD.
+
+Pulls historical M15 bars from MT5, walks them chronologically, detects the
+London Breakout setup per `memory/playbook.md`, simulates pending-order fills
+against bar extremes, applies fixed SL/TP, and reports aggregate stats.
+
+Deliberate Phase-1 scope and simplifications (to flag in the report):
+  - Single setup (London Breakout), single symbol (EURUSD).
+  - Fixed-TP exit only; does NOT simulate manage-runners partials/trailing.
+    Live results will differ (typically: fewer full-R wins, some winners
+    caught mid-move by the partial-close + trail pattern).
+  - No news filter -- trades through NFP/FOMC days that the LLM rubric would
+    skip live. Expect slightly lower win rate than live.
+  - No LLM rubric -- rubric items 1 (playbook match) and 4 (R:R ≥ 2.0) are
+    built-in; items 2/3/5 (HTF trend, news clear, meaningful level) are
+    forced-true. Live LLM judgment skips some of these, raising live expectancy.
+  - Single position at a time (MVP). Real guardrails allow up to 3 concurrent.
+  - Risk per trade fixed at 0.5% (B-grade). A-grade sizing (1%) not modeled.
+  - Daily DD hard-stop enforced at 4% to mirror `config/fundednext.yml`.
+
+Usage:
+    python -m scripts.backtest --from 2025-04-01 --to 2026-04-01
+    python -m scripts.backtest --from 2025-04-01 --to 2026-04-01 --output results/
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import sys
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime, time as dt_time, timedelta
+from pathlib import Path
+
+from .broker.base import Bar, OrderSide, Timeframe
+
+
+# ----------------------------- Data loading ---------------------------------
+
+def load_mt5_history(symbol: str, tf: Timeframe, start: datetime, end: datetime) -> list[Bar]:
+    """Pull bars from MT5 terminal via `copy_rates_range`.
+
+    Requires MT5 terminal running + the `MetaTrader5` pip package. Loads
+    env from .env so MT5_LOGIN / MT5_PASSWORD / MT5_SERVER are available.
+    """
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass
+    import MetaTrader5 as mt5  # type: ignore[import-not-found]
+
+    if not mt5.initialize():
+        raise RuntimeError(f"MT5 init failed: {mt5.last_error()}")
+    try:
+        tf_map = {
+            Timeframe.M15: mt5.TIMEFRAME_M15,
+            Timeframe.H1: mt5.TIMEFRAME_H1,
+            Timeframe.H4: mt5.TIMEFRAME_H4,
+            Timeframe.D1: mt5.TIMEFRAME_D1,
+        }
+        if tf not in tf_map:
+            raise ValueError(f"Timeframe {tf} not supported by backtest loader")
+        if not mt5.symbol_select(symbol, True):
+            raise RuntimeError(f"Cannot select symbol {symbol!r}")
+        raw = mt5.copy_rates_range(symbol, tf_map[tf], start, end)
+        if raw is None or len(raw) == 0:
+            raise RuntimeError(
+                f"MT5 returned no bars for {symbol} {tf.value} "
+                f"{start.date()}..{end.date()} -- broker may not retain this far back."
+            )
+        return [
+            Bar(
+                time=datetime.fromtimestamp(int(r["time"]), tz=UTC),
+                open=float(r["open"]),
+                high=float(r["high"]),
+                low=float(r["low"]),
+                close=float(r["close"]),
+                tick_volume=int(r["tick_volume"]),
+            )
+            for r in raw
+        ]
+    finally:
+        mt5.shutdown()
+
+
+# --------------------------- Setup detection --------------------------------
+
+@dataclass(frozen=True)
+class BreakoutSignal:
+    """Detected London Breakout, ready to place as pending."""
+    signal_time: datetime          # bar that produced the break
+    side: OrderSide
+    entry: float                   # retest level (broken edge)
+    sl: float                      # Asian range midpoint
+    tp: float                      # 1.5× range from break point
+    asian_high: float
+    asian_low: float
+    break_close: float
+
+
+def detect_london_breakout(
+    day_bars: list[Bar], *, min_range_pips: float = 20.0, pip_size: float = 0.0001,
+) -> BreakoutSignal | None:
+    """Detect the London Breakout signal for bars belonging to a single UTC day.
+
+    Asian range = high/low of 00:00–07:00 UTC bars.
+    Break = first bar in 07:00–09:00 UTC that CLOSES outside the range.
+    Entry = the broken edge (retest); SL = Asian midpoint; TP = 1.5R from break.
+    Returns None if no break or range below min_range_pips.
+    """
+    asian = [b for b in day_bars if b.time.time() < dt_time(7, 0)]
+    london = [
+        b for b in day_bars
+        if dt_time(7, 0) <= b.time.time() < dt_time(9, 0)
+    ]
+    if not asian or not london:
+        return None
+
+    asian_high = max(b.high for b in asian)
+    asian_low = min(b.low for b in asian)
+    asian_range = asian_high - asian_low
+    if asian_range / pip_size < min_range_pips:
+        return None
+    asian_mid = (asian_high + asian_low) / 2.0
+
+    for bar in london:
+        if bar.close > asian_high:
+            tp = bar.close + 1.5 * asian_range
+            return BreakoutSignal(
+                signal_time=bar.time, side=OrderSide.BUY,
+                entry=asian_high, sl=asian_mid, tp=tp,
+                asian_high=asian_high, asian_low=asian_low, break_close=bar.close,
+            )
+        if bar.close < asian_low:
+            tp = bar.close - 1.5 * asian_range
+            return BreakoutSignal(
+                signal_time=bar.time, side=OrderSide.SELL,
+                entry=asian_low, sl=asian_mid, tp=tp,
+                asian_high=asian_high, asian_low=asian_low, break_close=bar.close,
+            )
+    return None
+
+
+# -------------------------- Simulated trade record --------------------------
+
+@dataclass
+class SimulatedTrade:
+    symbol: str
+    side: str                      # "buy" | "sell"
+    setup: str
+    signal_time: datetime
+    fill_time: datetime | None
+    close_time: datetime | None
+    entry_planned: float
+    entry_fill: float | None
+    sl: float
+    tp: float
+    exit_price: float | None
+    exit_reason: str | None        # "tp" | "sl" | "eow" | "dd_stop" | "end" | "expired"
+    r_multiple: float | None
+    pnl_r: float | None            # realized R for stats (None if not filled)
+
+
+# -------------------------------- Simulator ---------------------------------
+
+@dataclass(frozen=True)
+class BacktestConfig:
+    symbol: str = "EURUSD"
+    initial_balance: float = 50_000.0
+    risk_pct: float = 0.5          # B-grade default; Phase 1 does not model A-grade
+    pip_size: float = 0.0001
+    spread_pips: float = 0.2
+    min_asian_range_pips: float = 20.0
+    pending_expire_hours: int = 8  # cancel if not filled by end of London session
+    daily_dd_hard_stop_pct: float = 4.0
+    max_dd_hard_stop_pct: float = 8.0
+    eow_flatten_utc_hour: int = 21  # Friday 21:00 UTC
+
+
+def run_backtest(
+    bars: list[Bar], *, config: BacktestConfig = BacktestConfig(),
+) -> tuple[list[SimulatedTrade], list[tuple[datetime, float]]]:
+    """Walk M15 bars chronologically; return (trades, equity_curve_points)."""
+    if not bars:
+        return [], []
+
+    trades: list[SimulatedTrade] = []
+    equity_curve: list[tuple[datetime, float]] = []
+
+    balance = config.initial_balance
+    peak_balance = balance
+    spread = config.spread_pips * config.pip_size
+
+    open_trade: SimulatedTrade | None = None
+    pending: BreakoutSignal | None = None
+    pending_placed_at: datetime | None = None
+
+    current_day = None
+    day_start_balance = balance
+    day_already_traded = False  # one setup fill per day
+
+    # Pre-index bars by UTC date for setup detection
+    by_day: dict[object, list[Bar]] = {}
+    for b in bars:
+        by_day.setdefault(b.time.date(), []).append(b)
+
+    max_dd_hit = False
+
+    for bar in bars:
+        # --- day rollover -------------------------------------------------
+        if current_day != bar.time.date():
+            current_day = bar.time.date()
+            day_start_balance = balance
+            pending = None
+            pending_placed_at = None
+            day_already_traded = False
+
+        # --- setup detection (once we've seen 09:00 bars for the day) ----
+        if (
+            open_trade is None
+            and pending is None
+            and not day_already_traded
+            and bar.time.time() >= dt_time(7, 0)
+        ):
+            sig = detect_london_breakout(
+                by_day[current_day],
+                min_range_pips=config.min_asian_range_pips,
+                pip_size=config.pip_size,
+            )
+            if sig is not None and bar.time >= sig.signal_time:
+                pending = sig
+                pending_placed_at = bar.time
+
+        # --- open position: SL / TP / EOW flatten -------------------------
+        if open_trade is not None:
+            exit_reason: str | None = None
+            exit_price: float | None = None
+            side_sign = 1.0 if open_trade.side == "buy" else -1.0
+
+            hit_sl = (
+                bar.low <= open_trade.sl
+                if open_trade.side == "buy"
+                else bar.high >= open_trade.sl
+            )
+            hit_tp = (
+                bar.high >= open_trade.tp
+                if open_trade.side == "buy"
+                else bar.low <= open_trade.tp
+            )
+            # Conservative: if both hit within the same bar, assume SL first.
+            if hit_sl:
+                exit_reason = "sl"
+                exit_price = open_trade.sl
+            elif hit_tp:
+                exit_reason = "tp"
+                exit_price = open_trade.tp
+            # Friday flatten: EOW at configured UTC hour
+            elif (
+                bar.time.weekday() == 4
+                and bar.time.time() >= dt_time(config.eow_flatten_utc_hour, 0)
+            ):
+                exit_reason = "eow"
+                exit_price = bar.close
+
+            if exit_reason:
+                risk_per_unit = abs(open_trade.entry_fill - open_trade.sl)
+                r = (exit_price - open_trade.entry_fill) * side_sign / max(risk_per_unit, 1e-12)
+                risk_dollars = day_start_balance * (config.risk_pct / 100.0)
+                pnl = r * risk_dollars
+                balance += pnl
+                peak_balance = max(peak_balance, balance)
+
+                open_trade.close_time = bar.time
+                open_trade.exit_price = exit_price
+                open_trade.exit_reason = exit_reason
+                open_trade.r_multiple = r
+                open_trade.pnl_r = r
+                trades.append(open_trade)
+                open_trade = None
+
+        # --- pending trigger / expiry -------------------------------------
+        if pending is not None and open_trade is None:
+            triggered = (
+                pending.side == OrderSide.BUY and bar.low <= pending.entry
+            ) or (
+                pending.side == OrderSide.SELL and bar.high >= pending.entry
+            )
+            if triggered:
+                fill = (
+                    pending.entry + spread
+                    if pending.side == OrderSide.BUY
+                    else pending.entry - spread
+                )
+                open_trade = SimulatedTrade(
+                    symbol=config.symbol,
+                    side=pending.side.value,
+                    setup="london_breakout",
+                    signal_time=pending.signal_time,
+                    fill_time=bar.time,
+                    close_time=None,
+                    entry_planned=pending.entry,
+                    entry_fill=fill,
+                    sl=pending.sl,
+                    tp=pending.tp,
+                    exit_price=None,
+                    exit_reason=None,
+                    r_multiple=None,
+                    pnl_r=None,
+                )
+                pending = None
+                pending_placed_at = None
+                day_already_traded = True
+            elif (
+                pending_placed_at is not None
+                and (bar.time - pending_placed_at) > timedelta(hours=config.pending_expire_hours)
+            ):
+                # Log the expired signal as a non-filled record so stats can count skips
+                trades.append(SimulatedTrade(
+                    symbol=config.symbol, side=pending.side.value,
+                    setup="london_breakout", signal_time=pending.signal_time,
+                    fill_time=None, close_time=bar.time,
+                    entry_planned=pending.entry, entry_fill=None,
+                    sl=pending.sl, tp=pending.tp,
+                    exit_price=None, exit_reason="expired",
+                    r_multiple=None, pnl_r=None,
+                ))
+                pending = None
+                pending_placed_at = None
+                day_already_traded = True
+
+        # --- daily + max DD gate -----------------------------------------
+        equity = balance
+        if open_trade is not None:
+            side_sign = 1.0 if open_trade.side == "buy" else -1.0
+            risk_per_unit = abs(open_trade.entry_fill - open_trade.sl)
+            unreal_r = (bar.close - open_trade.entry_fill) * side_sign / max(risk_per_unit, 1e-12)
+            risk_dollars = day_start_balance * (config.risk_pct / 100.0)
+            equity = balance + unreal_r * risk_dollars
+
+        daily_dd_pct = max(0.0, 100.0 * (day_start_balance - equity) / max(day_start_balance, 1e-9))
+        max_dd_pct = max(0.0, 100.0 * (peak_balance - equity) / max(peak_balance, 1e-9))
+
+        if max_dd_pct >= config.max_dd_hard_stop_pct:
+            max_dd_hit = True
+
+        if (
+            open_trade is not None
+            and (daily_dd_pct >= config.daily_dd_hard_stop_pct or max_dd_hit)
+        ):
+            # Force-close at bar close
+            side_sign = 1.0 if open_trade.side == "buy" else -1.0
+            risk_per_unit = abs(open_trade.entry_fill - open_trade.sl)
+            r = (bar.close - open_trade.entry_fill) * side_sign / max(risk_per_unit, 1e-12)
+            risk_dollars = day_start_balance * (config.risk_pct / 100.0)
+            balance += r * risk_dollars
+            peak_balance = max(peak_balance, balance)
+            open_trade.close_time = bar.time
+            open_trade.exit_price = bar.close
+            open_trade.exit_reason = "dd_stop"
+            open_trade.r_multiple = r
+            open_trade.pnl_r = r
+            trades.append(open_trade)
+            open_trade = None
+            pending = None
+
+        equity_curve.append((bar.time, equity))
+
+    # Close any position still open at end of data
+    if open_trade is not None:
+        last = bars[-1]
+        side_sign = 1.0 if open_trade.side == "buy" else -1.0
+        risk_per_unit = abs(open_trade.entry_fill - open_trade.sl)
+        r = (last.close - open_trade.entry_fill) * side_sign / max(risk_per_unit, 1e-12)
+        risk_dollars = day_start_balance * (config.risk_pct / 100.0)
+        balance += r * risk_dollars
+        open_trade.close_time = last.time
+        open_trade.exit_price = last.close
+        open_trade.exit_reason = "end"
+        open_trade.r_multiple = r
+        open_trade.pnl_r = r
+        trades.append(open_trade)
+
+    return trades, equity_curve
+
+
+# --------------------------------- Stats ------------------------------------
+
+@dataclass(frozen=True)
+class BacktestStats:
+    total_signals: int
+    filled: int
+    expired: int
+    wins: int
+    losses: int
+    win_rate_pct: float
+    avg_r: float
+    total_r: float
+    best_r: float
+    worst_r: float
+    max_daily_drawdown_pct: float
+    max_overall_drawdown_pct: float
+    final_balance: float
+    initial_balance: float
+    return_pct: float
+    dd_stop_triggered: bool
+
+
+def compute_stats(
+    trades: list[SimulatedTrade],
+    equity_curve: list[tuple[datetime, float]],
+    config: BacktestConfig,
+) -> BacktestStats:
+    filled = [t for t in trades if t.entry_fill is not None and t.r_multiple is not None]
+    expired = [t for t in trades if t.exit_reason == "expired"]
+    wins = [t for t in filled if (t.r_multiple or 0.0) > 0]
+    losses = [t for t in filled if (t.r_multiple or 0.0) <= 0]
+    rs = [t.r_multiple for t in filled if t.r_multiple is not None]
+
+    if equity_curve:
+        balances = [e for _, e in equity_curve]
+        peak = config.initial_balance
+        max_dd = 0.0
+        for b in balances:
+            peak = max(peak, b)
+            dd = 100.0 * (peak - b) / max(peak, 1e-9)
+            max_dd = max(max_dd, dd)
+        final_balance = balances[-1]
+    else:
+        max_dd = 0.0
+        final_balance = config.initial_balance
+
+    # Max daily DD: compute per-day from equity_curve
+    max_daily_dd = 0.0
+    by_day: dict[object, list[float]] = {}
+    for ts, eq in equity_curve:
+        by_day.setdefault(ts.date(), []).append(eq)
+    for _, equities in by_day.items():
+        if not equities:
+            continue
+        start_eq = equities[0]
+        day_low = min(equities)
+        dd = 100.0 * (start_eq - day_low) / max(start_eq, 1e-9)
+        max_daily_dd = max(max_daily_dd, dd)
+
+    dd_triggered = any(t.exit_reason == "dd_stop" for t in trades)
+
+    return BacktestStats(
+        total_signals=len(trades),
+        filled=len(filled),
+        expired=len(expired),
+        wins=len(wins),
+        losses=len(losses),
+        win_rate_pct=(100.0 * len(wins) / len(filled)) if filled else 0.0,
+        avg_r=(sum(rs) / len(rs)) if rs else 0.0,
+        total_r=sum(rs) if rs else 0.0,
+        best_r=max(rs) if rs else 0.0,
+        worst_r=min(rs) if rs else 0.0,
+        max_daily_drawdown_pct=round(max_daily_dd, 2),
+        max_overall_drawdown_pct=round(max_dd, 2),
+        final_balance=round(final_balance, 2),
+        initial_balance=config.initial_balance,
+        return_pct=round(100.0 * (final_balance - config.initial_balance) / config.initial_balance, 2),
+        dd_stop_triggered=dd_triggered,
+    )
+
+
+# --------------------------------- Report -----------------------------------
+
+def format_report(stats: BacktestStats, trades: list[SimulatedTrade], config: BacktestConfig) -> str:
+    lines = [
+        "=" * 72,
+        f"  BACKTEST REPORT -- {config.symbol} London Breakout (Phase 1)",
+        "=" * 72,
+        "",
+        f"  Period:        {trades[0].signal_time.date() if trades else '-'}"
+        f" -> {trades[-1].close_time.date() if trades and trades[-1].close_time else '-'}",
+        f"  Initial:       ${config.initial_balance:,.2f}",
+        f"  Final:         ${stats.final_balance:,.2f}  ({stats.return_pct:+.2f}%)",
+        "",
+        "  SIGNALS / FILLS",
+        f"    Total signals:   {stats.total_signals}",
+        f"    Filled:          {stats.filled}",
+        f"    Expired (no fill): {stats.expired}",
+        "",
+        "  FILLED TRADE OUTCOMES",
+        f"    Wins:            {stats.wins}",
+        f"    Losses:          {stats.losses}",
+        f"    Win rate:        {stats.win_rate_pct:.1f}%",
+        f"    Avg R:           {stats.avg_r:+.3f}",
+        f"    Total R:         {stats.total_r:+.2f}",
+        f"    Best / Worst:    {stats.best_r:+.2f}R / {stats.worst_r:+.2f}R",
+        "",
+        "  RISK",
+        f"    Max daily DD:    {stats.max_daily_drawdown_pct:.2f}%",
+        f"    Max overall DD:  {stats.max_overall_drawdown_pct:.2f}%",
+        f"    DD hard stop hit: {stats.dd_stop_triggered}",
+        "",
+        "  PHASE 1 LIMITATIONS",
+        "    - No manage-runners (no partials/trailing) -- fixed SL/TP only",
+        "    - No news filter -- red-folder events not excluded",
+        "    - LLM rubric absent -- items 2/3/5 forced true",
+        "    - Single position at a time (real cap is 3 concurrent)",
+        "    - Fixed 0.5% risk per trade (B-grade); no A-grade sizing",
+        "=" * 72,
+    ]
+    return "\n".join(lines)
+
+
+def save_results(output_dir: Path, stats: BacktestStats, trades: list[SimulatedTrade], config: BacktestConfig) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with (output_dir / "stats.json").open("w", encoding="utf-8") as f:
+        json.dump({"stats": asdict(stats), "config": asdict(config)}, f, indent=2, default=str)
+    with (output_dir / "trades.csv").open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "signal_time", "fill_time", "close_time", "side", "entry_planned",
+            "entry_fill", "sl", "tp", "exit_price", "exit_reason", "r_multiple",
+        ])
+        for t in trades:
+            writer.writerow([
+                t.signal_time.isoformat(),
+                t.fill_time.isoformat() if t.fill_time else "",
+                t.close_time.isoformat() if t.close_time else "",
+                t.side,
+                t.entry_planned,
+                t.entry_fill if t.entry_fill is not None else "",
+                t.sl, t.tp,
+                t.exit_price if t.exit_price is not None else "",
+                t.exit_reason or "",
+                f"{t.r_multiple:.4f}" if t.r_multiple is not None else "",
+            ])
+
+
+# ---------------------------------- CLI -------------------------------------
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="python -m scripts.backtest")
+    parser.add_argument("--symbol", default="EURUSD", help="default: EURUSD")
+    parser.add_argument("--from", dest="start", required=True, help="YYYY-MM-DD (UTC)")
+    parser.add_argument("--to", dest="end", required=True, help="YYYY-MM-DD (UTC)")
+    parser.add_argument("--balance", type=float, default=50_000.0)
+    parser.add_argument("--risk-pct", type=float, default=0.5)
+    parser.add_argument("--min-range-pips", type=float, default=20.0)
+    parser.add_argument("--output", help="Dir for CSV + JSON results")
+    parser.add_argument("--json", action="store_true", help="Print stats as JSON instead of text report")
+    args = parser.parse_args(argv)
+
+    start = datetime.fromisoformat(args.start).replace(tzinfo=UTC)
+    end = datetime.fromisoformat(args.end).replace(tzinfo=UTC)
+
+    print(f"[backtest] loading {args.symbol} M15 bars from MT5 ({start.date()} -> {end.date()})...", file=sys.stderr)
+    bars = load_mt5_history(args.symbol, Timeframe.M15, start, end)
+    print(f"[backtest] loaded {len(bars)} M15 bars", file=sys.stderr)
+
+    config = BacktestConfig(
+        symbol=args.symbol,
+        initial_balance=args.balance,
+        risk_pct=args.risk_pct,
+        min_asian_range_pips=args.min_range_pips,
+    )
+
+    print("[backtest] running simulation...", file=sys.stderr)
+    trades, equity_curve = run_backtest(bars, config=config)
+    stats = compute_stats(trades, equity_curve, config)
+
+    if args.json:
+        print(json.dumps({"stats": asdict(stats), "config": asdict(config)}, indent=2, default=str))
+    else:
+        print(format_report(stats, trades, config))
+
+    if args.output:
+        out = Path(args.output)
+        save_results(out, stats, trades, config)
+        print(f"[backtest] results saved to {out.resolve()}", file=sys.stderr)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
