@@ -47,3 +47,6 @@ logs/
 
 # Claude Code local overrides
 .claude/settings.local.json
+
+# Local-only scheduler launcher (paths are machine-specific)
+run-routine.cmd
