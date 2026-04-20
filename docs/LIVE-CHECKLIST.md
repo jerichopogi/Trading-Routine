@@ -96,6 +96,61 @@ Session focus for this run: <SESSION> open.
 
 ---
 
+## 2b. Revised session-close task prompt — daily pending-order cleanup
+
+The routine `.claude/routines/session-close.md` flattens positions (plus pending orders, via `trade.flatten_all(cancel_pending=True)`) **only on Fridays**. Mon-Thu it closes "intraday"-tagged positions but leaves every un-triggered pending order sitting on MT5 **overnight**. Those pending orders carry a thesis baked in at placement time — by next morning's Asian session, conditions may have shifted and the stale level may fill in a regime that no longer supports the original idea.
+
+Fix: override the session-close task prompt to cancel every pending order daily, not just Friday.
+
+**Replace** the Prompt field on the `session-close-ny` Desktop scheduled task with this:
+
+```
+Execute the session-close routine: @.claude/routines/session-close.md
+
+END-OF-DAY PENDING ORDER CLEANUP (post-Phase-3 tightening).
+
+Regardless of whether today is Friday or not, after the routine's normal
+flow (journaling, intraday close, Friday-flatten branch), ALWAYS cancel
+every un-triggered pending order before ending the session. Stale pending
+orders from this session's thesis must not carry into tomorrow's Asian
+opening when conditions may have shifted.
+
+Run this after the routine's journaling step:
+
+    python -m scripts.cli cancel-pending --reason "session-close daily sweep"
+
+Then verify:
+
+    python -m scripts.cli pending --json
+
+Expected output: `[]` (empty). If any pending remains, investigate and
+retry cancellation — do NOT end the session with pending orders live.
+
+Final Discord notify body must include a line:
+    "Pending orders cancelled: N"
+
+(The Friday-flatten branch already cancels pending via flatten_all with
+cancel_pending=True; the daily sweep above is additional insurance and
+covers Mon-Thu explicitly.)
+```
+
+**Why this is safe:**
+
+- `cancel-pending` only touches un-triggered pending orders (never positions, never fills)
+- Re-drafting next session is cheap — pre-session builds fresh context with today's catalysts
+- Friday behavior unchanged (flatten_all still runs first); now Mon-Thu matches
+
+**Optional belt-and-braces:** add the same `cancel-pending` call to `midday-breakeven` to kill any pending sitting > 8 hours. Session-close alone is sufficient; this is only if you want tighter overnight hygiene.
+
+**Paste flow:**
+
+1. Claude Desktop → Schedule → `session-close-ny` → pencil icon
+2. Replace the Prompt field with the block above
+3. Save
+4. Optional: click **Run now** once to pre-approve permissions
+
+---
+
 ## 3. Monitoring tolerances
 
 Copy-paste these into a pinned Discord message before trading starts. Check daily.
