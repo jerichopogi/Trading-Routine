@@ -746,6 +746,277 @@ def compute_stats(
     )
 
 
+# --------------------------- Portfolio simulation ---------------------------
+
+@dataclass(frozen=True)
+class PortfolioEntry:
+    """One (symbol, timeframe, setup) to include in the portfolio."""
+    symbol: str
+    timeframe: Timeframe
+    setup: str                     # "london_breakout" | "ny_momentum" | "gold_pullback" | "failed_breakout_fade"
+    pip_size: float
+
+
+@dataclass(frozen=True)
+class PortfolioStats:
+    total_trade_attempts: int      # all signals that tried to enter
+    filled: int                    # actually taken (passed concurrent + DD gates)
+    skipped_concurrent: int
+    skipped_dd: int
+    wins: int
+    losses: int
+    win_rate_pct: float
+    avg_r_per_trade: float
+    total_r: float
+    final_balance: float
+    initial_balance: float
+    return_pct: float
+    max_daily_dd_pct: float
+    max_overall_dd_pct: float
+    dd_hard_stop_hit: bool
+    by_setup: dict[str, int]       # count filled per setup
+    by_symbol: dict[str, int]      # count filled per symbol
+
+
+@dataclass(frozen=True)
+class PortfolioConfig:
+    initial_balance: float = 50_000.0
+    risk_pct: float = 0.5
+    max_concurrent_positions: int = 3
+    daily_dd_hard_stop_pct: float = 4.0
+    max_dd_hard_stop_pct: float = 8.0
+
+
+def _build_detector_for_entry(entry: PortfolioEntry, bars: list[Bar]):
+    if entry.setup == "london_breakout":
+        return _default_detector
+    if entry.setup == "ny_momentum":
+        def d(day_bars, all_bars, cfg):
+            return detect_ny_momentum(day_bars)
+        return d
+    if entry.setup == "gold_pullback":
+        return make_gold_pullback_detector(bars)
+    if entry.setup == "failed_breakout_fade":
+        return make_failed_breakout_fade_detector(bars)
+    raise ValueError(f"Unknown setup: {entry.setup}")
+
+
+def run_portfolio(
+    entries: list[PortfolioEntry],
+    *,
+    start: datetime,
+    end: datetime,
+    config: PortfolioConfig = PortfolioConfig(),
+    bar_loader=None,
+) -> tuple[list[SimulatedTrade], PortfolioStats, list[tuple[datetime, float]]]:
+    """Run every entry independently, then replay their trades globally.
+
+    Uses event-replay: each independent backtest produces a list of trades
+    with fill_time, close_time, r_multiple. We sort all filled trades by
+    fill_time, walk chronologically, and take each one only if:
+      - concurrent positions < max_concurrent_positions, AND
+      - daily DD hasn't breached hard stop.
+
+    Skipped trades are discarded (they never took a slot). Taken trades
+    apply their pre-computed r_multiple against CURRENT balance at entry.
+
+    Caveats vs a true interleaved-bar simulation:
+      - Each setup's r_multiple was computed in isolation, so manage-runners
+        and SL/TP hit on EACH trade already. Those outcomes are taken as
+        ground truth.
+      - We don't model correlation-driven co-movement: if two trades were
+        simulated separately and both won, we credit both. If they were
+        actually on correlated symbols, real live behavior might differ.
+      - Balance compounds correctly: each trade's R is applied to the
+        balance AT ENTRY, capturing equity-curve compounding across setups.
+    """
+    if bar_loader is None:
+        bar_loader = lambda sym, tf: load_mt5_history(sym, tf, start, end)
+
+    # Step 1 — run each entry's individual backtest
+    all_trades: list[SimulatedTrade] = []
+    per_entry_config_for_log: dict[str, BacktestConfig] = {}
+    for entry in entries:
+        bars = bar_loader(entry.symbol, entry.timeframe)
+        bt_cfg = BacktestConfig(
+            symbol=entry.symbol,
+            initial_balance=config.initial_balance,
+            risk_pct=config.risk_pct,
+            pip_size=entry.pip_size,
+            enable_manage_runners=True,
+        )
+        detector = _build_detector_for_entry(entry, bars)
+        trades, _ = run_backtest(bars, config=bt_cfg, detector=detector)
+        all_trades.extend(t for t in trades if t.entry_fill is not None and t.fill_time is not None)
+        per_entry_config_for_log[f"{entry.symbol}/{entry.setup}"] = bt_cfg
+
+    # Step 2 — chronological replay with global state
+    all_trades.sort(key=lambda t: t.fill_time)
+
+    balance = config.initial_balance
+    peak_balance = balance
+    equity_curve: list[tuple[datetime, float]] = [(start, balance)]
+    concurrent: list[SimulatedTrade] = []   # open positions, sorted by close_time
+    taken: list[SimulatedTrade] = []
+    skipped_cap = 0
+    skipped_dd = 0
+    current_day = None
+    day_start_balance = balance
+    day_lowest_balance = balance
+    daily_dd_stop_today = False
+    max_daily_dd = 0.0
+    max_overall_dd = 0.0
+    dd_hit = False
+
+    def _close_expired_up_to(now: datetime) -> None:
+        nonlocal balance, peak_balance, concurrent, day_lowest_balance, max_overall_dd
+        concurrent.sort(key=lambda t: t.close_time or now)
+        while concurrent and (concurrent[0].close_time or now) <= now:
+            t = concurrent.pop(0)
+            # Realize R against the entry-balance snapshot we stored on t.pnl_r-base
+            entry_bal = getattr(t, "_entry_balance", day_start_balance)
+            risk_dollars = entry_bal * (config.risk_pct / 100.0)
+            balance += (t.r_multiple or 0.0) * risk_dollars
+            peak_balance = max(peak_balance, balance)
+            day_lowest_balance = min(day_lowest_balance, balance)
+            dd_pct = 100.0 * (peak_balance - balance) / max(peak_balance, 1e-9)
+            max_overall_dd = max(max_overall_dd, dd_pct)
+            equity_curve.append((t.close_time or now, balance))
+
+    for trade in all_trades:
+        fill_time = trade.fill_time
+        # Realize closes that happened before this entry
+        _close_expired_up_to(fill_time)
+
+        # Day rollover
+        if current_day != fill_time.date():
+            if current_day is not None:
+                dd_today = 100.0 * (day_start_balance - day_lowest_balance) / max(day_start_balance, 1e-9)
+                max_daily_dd = max(max_daily_dd, dd_today)
+            current_day = fill_time.date()
+            day_start_balance = balance
+            day_lowest_balance = balance
+            daily_dd_stop_today = False
+
+        # Daily DD gate
+        cur_daily_dd = 100.0 * (day_start_balance - balance) / max(day_start_balance, 1e-9)
+        if cur_daily_dd >= config.daily_dd_hard_stop_pct:
+            daily_dd_stop_today = True
+            dd_hit = True
+        cur_overall_dd = 100.0 * (peak_balance - balance) / max(peak_balance, 1e-9)
+        if cur_overall_dd >= config.max_dd_hard_stop_pct:
+            dd_hit = True
+
+        if daily_dd_stop_today or dd_hit:
+            skipped_dd += 1
+            continue
+
+        # Concurrent cap
+        if len(concurrent) >= config.max_concurrent_positions:
+            skipped_cap += 1
+            continue
+
+        # Take the trade; stamp the entry balance for later R sizing
+        trade._entry_balance = balance  # type: ignore[attr-defined]
+        concurrent.append(trade)
+        taken.append(trade)
+        equity_curve.append((fill_time, balance))
+
+    # Realize remaining positions
+    if concurrent:
+        last_close = max((t.close_time or end) for t in concurrent)
+        _close_expired_up_to(last_close)
+
+    # Final daily DD for the last day
+    if current_day is not None:
+        dd_today = 100.0 * (day_start_balance - day_lowest_balance) / max(day_start_balance, 1e-9)
+        max_daily_dd = max(max_daily_dd, dd_today)
+
+    rs = [t.r_multiple for t in taken if t.r_multiple is not None]
+    wins = sum(1 for r in rs if r > 0)
+    losses = sum(1 for r in rs if r <= 0)
+    by_setup: dict[str, int] = {}
+    by_symbol: dict[str, int] = {}
+    for t in taken:
+        by_setup[t.setup] = by_setup.get(t.setup, 0) + 1
+        by_symbol[t.symbol] = by_symbol.get(t.symbol, 0) + 1
+
+    stats = PortfolioStats(
+        total_trade_attempts=len(all_trades),
+        filled=len(taken),
+        skipped_concurrent=skipped_cap,
+        skipped_dd=skipped_dd,
+        wins=wins,
+        losses=losses,
+        win_rate_pct=(100.0 * wins / len(rs)) if rs else 0.0,
+        avg_r_per_trade=(sum(rs) / len(rs)) if rs else 0.0,
+        total_r=sum(rs) if rs else 0.0,
+        final_balance=round(balance, 2),
+        initial_balance=config.initial_balance,
+        return_pct=round(100.0 * (balance - config.initial_balance) / config.initial_balance, 2),
+        max_daily_dd_pct=round(max_daily_dd, 2),
+        max_overall_dd_pct=round(max_overall_dd, 2),
+        dd_hard_stop_hit=dd_hit,
+        by_setup=by_setup,
+        by_symbol=by_symbol,
+    )
+    return taken, stats, equity_curve
+
+
+def format_portfolio_report(stats: PortfolioStats, taken: list[SimulatedTrade]) -> str:
+    lines = [
+        "=" * 72,
+        "  PORTFOLIO BACKTEST REPORT",
+        "=" * 72,
+        "",
+        f"  Initial: ${stats.initial_balance:,.2f}   Final: ${stats.final_balance:,.2f}  ({stats.return_pct:+.2f}%)",
+        "",
+        "  FLOW",
+        f"    Total signal attempts:  {stats.total_trade_attempts}",
+        f"    Filled (taken):         {stats.filled}",
+        f"    Skipped (cap >=3 open): {stats.skipped_concurrent}",
+        f"    Skipped (DD hard stop): {stats.skipped_dd}",
+        "",
+        "  OUTCOMES (taken trades)",
+        f"    Wins:      {stats.wins}",
+        f"    Losses:    {stats.losses}",
+        f"    Win rate:  {stats.win_rate_pct:.1f}%",
+        f"    Avg R:     {stats.avg_r_per_trade:+.3f}",
+        f"    Total R:   {stats.total_r:+.2f}",
+        "",
+        "  RISK",
+        f"    Max daily DD:     {stats.max_daily_dd_pct:.2f}%",
+        f"    Max overall DD:   {stats.max_overall_dd_pct:.2f}%",
+        f"    DD hard stop hit: {stats.dd_hard_stop_hit}",
+        "",
+        "  BY SETUP",
+    ]
+    for s, n in sorted(stats.by_setup.items(), key=lambda x: -x[1]):
+        lines.append(f"    {s:30s} {n:4d}")
+    lines.append("")
+    lines.append("  BY SYMBOL")
+    for s, n in sorted(stats.by_symbol.items(), key=lambda x: -x[1]):
+        lines.append(f"    {s:30s} {n:4d}")
+    lines.append("=" * 72)
+    return "\n".join(lines)
+
+
+DEFAULT_PORTFOLIO_ENTRIES: list[PortfolioEntry] = [
+    # FX Failed-Breakout Fade on H4 — anchor of the strategy
+    PortfolioEntry("EURUSD", Timeframe.H4, "failed_breakout_fade", 0.0001),
+    PortfolioEntry("GBPUSD", Timeframe.H4, "failed_breakout_fade", 0.0001),
+    PortfolioEntry("USDJPY", Timeframe.H4, "failed_breakout_fade", 0.01),
+    PortfolioEntry("AUDUSD", Timeframe.H4, "failed_breakout_fade", 0.0001),
+    # Gold Trend Pullback on H1
+    PortfolioEntry("XAUUSD", Timeframe.H1, "gold_pullback", 0.01),
+    # NY Open Momentum on winners only (drop US30 — backtest-negative)
+    PortfolioEntry("USTEC", Timeframe.M15, "ny_momentum", 1.0),
+    PortfolioEntry("US500", Timeframe.M15, "ny_momentum", 1.0),
+    # London Breakout on EURUSD M15 — low-expectancy, kept for diversification
+    PortfolioEntry("EURUSD", Timeframe.M15, "london_breakout", 0.0001),
+]
+
+
 # --------------------------------- Report -----------------------------------
 
 def format_report(stats: BacktestStats, trades: list[SimulatedTrade], config: BacktestConfig) -> str:
@@ -845,10 +1116,43 @@ def main(argv: list[str] | None = None) -> int:
         "--pip-size", type=float,
         help="Override pip size (default 0.0001 for FX, 1.0 for indices, 0.01 for XAUUSD)",
     )
+    parser.add_argument(
+        "--portfolio", action="store_true",
+        help="Run the full portfolio (all 4 playbook setups across 7 symbols)",
+    )
     args = parser.parse_args(argv)
 
     start = datetime.fromisoformat(args.start).replace(tzinfo=UTC)
     end = datetime.fromisoformat(args.end).replace(tzinfo=UTC)
+
+    if args.portfolio:
+        pcfg = PortfolioConfig(initial_balance=args.balance, risk_pct=args.risk_pct)
+        print(f"[backtest] running portfolio simulation ({len(DEFAULT_PORTFOLIO_ENTRIES)} entries)...", file=sys.stderr)
+        taken, pstats, equity = run_portfolio(
+            DEFAULT_PORTFOLIO_ENTRIES, start=start, end=end, config=pcfg,
+        )
+        if args.json:
+            print(json.dumps({"stats": asdict(pstats), "n_taken": len(taken)}, indent=2, default=str))
+        else:
+            print(format_portfolio_report(pstats, taken))
+        if args.output:
+            out = Path(args.output)
+            out.mkdir(parents=True, exist_ok=True)
+            with (out / "portfolio_stats.json").open("w", encoding="utf-8") as f:
+                json.dump(asdict(pstats), f, indent=2, default=str)
+            with (out / "portfolio_trades.csv").open("w", encoding="utf-8", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["fill_time", "close_time", "symbol", "side", "setup", "r_multiple", "entry_balance"])
+                for t in taken:
+                    w.writerow([
+                        t.fill_time.isoformat() if t.fill_time else "",
+                        t.close_time.isoformat() if t.close_time else "",
+                        t.symbol, t.side, t.setup,
+                        f"{t.r_multiple:.4f}" if t.r_multiple is not None else "",
+                        f"{getattr(t, '_entry_balance', 0):.2f}",
+                    ])
+            print(f"[backtest] portfolio results saved to {out.resolve()}", file=sys.stderr)
+        return 0
 
     # Sensible pip defaults per instrument class
     if args.symbol in {"US30", "NAS100", "SPX500", "GER40", "USTEC", "US500"}:
