@@ -1,0 +1,77 @@
+name: pre-session
+
+# Research/planning leg of the trading routine. Runs in the cloud with a
+# mock broker — never places orders. Real MT5 execution stays on the local
+# Windows box (session-open routine).
+#
+# Schedule:
+#   06:45 UTC Mon–Fri  — London pre-open
+#   13:00 UTC Mon–Fri  — NY pre-open
+#
+# Secrets required (Settings → Secrets and variables → Actions):
+#   PERPLEXITY_API_KEY   — Perplexity API key for research
+#   DISCORD_WEBHOOK_URL  — Discord webhook for notifications
+
+on:
+  schedule:
+    - cron: '45 6 * * 1-5'
+    - cron: '0 13 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      query:
+        description: 'Research query (optional; defaults to session-aware prompt)'
+        required: false
+        default: ''
+
+jobs:
+  research:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      TRADING_STAGE: dev
+      BROKER_MODE: mock
+      DISPLAY_TIMEZONE: America/New_York
+      PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Preflight (mock broker — sanity only)
+        run: python -m scripts.cli preflight --json
+
+      - name: Stats snapshot (last 30 days)
+        run: python -m scripts.cli stats --window 30
+
+      - name: Research catalysts
+        run: |
+          Q="${{ github.event.inputs.query }}"
+          if [ -z "$Q" ]; then
+            Q="EURUSD, GBPUSD, XAUUSD — top catalysts, prior-day levels, and any Fed/ECB/BoE speakers in the next 6 hours. Summarize the session bias."
+          fi
+          python -m scripts.cli research --query "$Q" | tee research.out
+
+      - name: Notify Discord
+        run: |
+          BODY=$(head -c 3500 research.out)
+          python -m scripts.cli notify \
+            --level info \
+            --title "Pre-session research (cloud) $(date -u +%Y-%m-%d\ %H:%M\ UTC)" \
+            --body "$BODY"
+
+      - name: Upload research artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: research-${{ github.run_id }}
+          path: research.out
+          retention-days: 14
