@@ -1,7 +1,7 @@
 # FundedNext Stellar 2-step — rule parameters.
 #
-# VERIFY these numbers against fundednext.com before first live money.
-# Prop firm rules drift. Last confirmed: not yet verified — placeholders.
+# Prop firm rules drift. Last confirmed: 2026-04-20 against live fundednext.com plan.
+# Re-verify if FundedNext updates its plan terms or if you switch plan size.
 #
 # "hard_stop" values are tighter than the firm limit so we never touch the wall.
 
@@ -49,9 +49,9 @@ instruments:
     - USDCAD
     - NZDUSD
     - US30
-    - NAS100
+    - NDX100
     - SPX500
-    - GER40
+    - GER30
     - XAUUSD
     - XAGUSD
   # Optional per-instrument overrides (e.g., tighter risk on volatile symbols).
