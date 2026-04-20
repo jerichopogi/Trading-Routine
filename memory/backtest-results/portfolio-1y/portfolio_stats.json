@@ -1,0 +1,32 @@
+{
+  "total_trade_attempts": 656,
+  "filled": 619,
+  "skipped_concurrent": 37,
+  "skipped_dd": 0,
+  "wins": 252,
+  "losses": 367,
+  "win_rate_pct": 40.710823909531506,
+  "avg_r_per_trade": 0.5198474325621169,
+  "total_r": 321.7855607559503,
+  "final_balance": 243320.91,
+  "initial_balance": 50000.0,
+  "return_pct": 386.64,
+  "max_daily_dd_pct": 2.97,
+  "max_overall_dd_pct": 4.7,
+  "dd_hard_stop_hit": false,
+  "by_setup": {
+    "london_breakout": 76,
+    "failed_breakout_fade": 366,
+    "ny_momentum": 20,
+    "gold_pullback": 157
+  },
+  "by_symbol": {
+    "EURUSD": 165,
+    "AUDUSD": 95,
+    "USTEC": 12,
+    "US500": 8,
+    "XAUUSD": 157,
+    "USDJPY": 87,
+    "GBPUSD": 95
+  }
+}
