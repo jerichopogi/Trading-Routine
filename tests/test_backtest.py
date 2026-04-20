@@ -9,9 +9,11 @@ import pytest
 from scripts.backtest import (
     BacktestConfig,
     Signal,
+    _compute_ema,
     compute_stats,
     detect_london_breakout,
     detect_ny_momentum,
+    make_gold_pullback_detector,
     run_backtest,
 )
 from scripts.broker.base import Bar, OrderKind, OrderSide
@@ -275,7 +277,7 @@ def test_simulator_with_ny_momentum_detector() -> None:
     bars.append(_bar(day + m15 * 55, 17555, 17620, 17550, 17600))
     bars.append(_bar(day + m15 * 56, 17600, 17740, 17580, 17740))  # hits TP 17740
 
-    def detector(day_bars, cfg):
+    def detector(day_bars, all_bars, cfg):
         return detect_ny_momentum(day_bars)
 
     config = BacktestConfig(symbol="NAS100", pip_size=1.0, enable_manage_runners=False)
@@ -286,6 +288,83 @@ def test_simulator_with_ny_momentum_detector() -> None:
     assert t.setup == "ny_momentum"
     assert t.side == "buy"
     assert t.exit_reason == "tp"
+
+
+# ---------- _compute_ema ----------
+
+
+def test_compute_ema_returns_none_before_seed() -> None:
+    ema = _compute_ema([1.0, 2.0, 3.0, 4.0, 5.0], period=3)
+    assert ema[0] is None
+    assert ema[1] is None
+    assert ema[2] == pytest.approx(2.0, abs=1e-9)  # SMA seed of first 3
+
+
+def test_compute_ema_converges_to_constant_input() -> None:
+    # After enough bars, constant input → EMA equals that constant
+    values = [50.0] * 100
+    ema = _compute_ema(values, period=20)
+    assert ema[-1] == pytest.approx(50.0, abs=1e-9)
+
+
+# ---------- make_gold_pullback_detector ----------
+
+
+def test_gold_pullback_bull_signal() -> None:
+    """Uptrend + wick into EMA20 + close above + upper-half body → BUY STOP."""
+    # Build a bull-trending series: 100 bars rising from 2300 to 2400
+    t0 = datetime(2026, 4, 20, 0, 0, tzinfo=UTC)
+    h1 = timedelta(hours=1)
+    bars: list[Bar] = []
+    for i in range(100):
+        p = 2300.0 + i * 1.0
+        bars.append(_bar(t0 + h1 * i, p - 0.5, p + 0.5, p - 0.5, p))
+    # Day bars: the last day of the run. Make the final bar a rejection:
+    # dips down well below EMA20, closes back above with close in upper half
+    last_t = bars[-1].time
+    # Reset the last bar to a rejection pattern
+    bars[-1] = _bar(last_t, 2398.0, 2400.0, 2385.0, 2399.0)  # wick down to 2385, close near high
+
+    # Just pass the single "day" (last bar) for detection
+    day_bars = [bars[-1]]
+    detector = make_gold_pullback_detector(bars)
+    sig = detector(day_bars, bars, BacktestConfig(symbol="XAUUSD", pip_size=0.01))
+    assert sig is not None
+    assert sig.side == OrderSide.BUY
+    assert sig.entry_kind == OrderKind.STOP
+    assert sig.entry > bars[-1].high  # entry is high + 1 pip
+
+
+def test_gold_pullback_no_signal_in_downtrend_for_buy() -> None:
+    """Downtrend (EMA20 < EMA50) must not produce BUY signals even with bull wicks."""
+    t0 = datetime(2026, 4, 20, 0, 0, tzinfo=UTC)
+    h1 = timedelta(hours=1)
+    bars: list[Bar] = []
+    # Descending price
+    for i in range(100):
+        p = 2400.0 - i * 1.0
+        bars.append(_bar(t0 + h1 * i, p + 0.5, p + 0.5, p - 0.5, p))
+    last_t = bars[-1].time
+    # Bullish-looking wick but in downtrend — should NOT trigger bull; may trigger bear
+    bars[-1] = _bar(last_t, 2300.0, 2315.0, 2298.0, 2301.0)  # close near low
+
+    day_bars = [bars[-1]]
+    detector = make_gold_pullback_detector(bars)
+    sig = detector(day_bars, bars, BacktestConfig(symbol="XAUUSD", pip_size=0.01))
+    # In downtrend + close in lower half → bear signal expected
+    if sig is not None:
+        assert sig.side == OrderSide.SELL
+
+
+def test_gold_pullback_no_signal_without_ema_context() -> None:
+    """Fewer than 50 bars → EMA50 is None → no signal."""
+    t0 = datetime(2026, 4, 20, 0, 0, tzinfo=UTC)
+    h1 = timedelta(hours=1)
+    bars = [_bar(t0 + h1 * i, 2300.0, 2301.0, 2299.0, 2300.0) for i in range(30)]
+    day_bars = [bars[-1]]
+    detector = make_gold_pullback_detector(bars)
+    sig = detector(day_bars, bars, BacktestConfig(symbol="XAUUSD", pip_size=0.01))
+    assert sig is None
 
 
 def test_manage_runners_toggle_changes_result() -> None:

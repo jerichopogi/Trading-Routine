@@ -141,6 +141,85 @@ def detect_london_breakout(
     return None
 
 
+def _compute_ema(values: list[float], period: int) -> list[float | None]:
+    """Exponential moving average. Returns None for the first period-1 entries."""
+    if period <= 0 or not values:
+        return [None] * len(values)
+    alpha = 2.0 / (period + 1.0)
+    out: list[float | None] = [None] * len(values)
+    if len(values) < period:
+        return out
+    # Seed with SMA of first `period` values
+    seed = sum(values[:period]) / period
+    out[period - 1] = seed
+    prev = seed
+    for i in range(period, len(values)):
+        prev = alpha * values[i] + (1.0 - alpha) * prev
+        out[i] = prev
+    return out
+
+
+def make_gold_pullback_detector(all_bars: list[Bar]):
+    """Build a detector closure for XAUUSD Gold Trend Pullback.
+
+    Pre-computes EMA20 and EMA50 across the full bar series (typically H1).
+    The returned detector is called per day; it looks up EMA values by bar
+    timestamp and scans for the rejection-wick pattern.
+
+    Rejection pattern (bull; mirror for bear):
+      - EMA20 > EMA50 at the rejection bar (uptrend)
+      - Bar's low <= EMA20 (touched or wicked below EMA20)
+      - Bar's close > EMA20 (reclaimed)
+      - Close in upper half of bar range (lower wick dominant)
+    Entry: bar.high + 1 point (STOP, break of rejection high)
+    SL:    EMA50 at signal bar (widest structural stop)
+    TP:    entry + 2R
+    """
+    closes = [b.close for b in all_bars]
+    ema20 = _compute_ema(closes, 20)
+    ema50 = _compute_ema(closes, 50)
+    idx_by_time = {b.time: i for i, b in enumerate(all_bars)}
+
+    def detector(day_bars: list[Bar], _all_bars: list[Bar], config: "BacktestConfig") -> Signal | None:
+        for bar in day_bars:
+            i = idx_by_time.get(bar.time)
+            if i is None or i == 0:
+                continue
+            e20 = ema20[i]
+            e50 = ema50[i]
+            if e20 is None or e50 is None:
+                continue
+            rng = bar.high - bar.low
+            if rng <= 0:
+                continue
+            close_pos = (bar.close - bar.low) / rng  # 0..1, upper=bullish
+            # Bull pullback-rejection
+            if e20 > e50 and bar.low <= e20 <= bar.close and close_pos > 0.6:
+                entry = bar.high + 1.0 * config.pip_size
+                sl = e50
+                if entry <= sl:
+                    continue
+                tp = entry + 2.0 * (entry - sl)
+                return Signal(
+                    setup="gold_pullback", signal_time=bar.time, side=OrderSide.BUY,
+                    entry_kind=OrderKind.STOP, entry=entry, sl=sl, tp=tp,
+                )
+            # Bear pullback-rejection
+            if e20 < e50 and bar.high >= e20 >= bar.close and close_pos < 0.4:
+                entry = bar.low - 1.0 * config.pip_size
+                sl = e50
+                if entry >= sl:
+                    continue
+                tp = entry - 2.0 * (sl - entry)
+                return Signal(
+                    setup="gold_pullback", signal_time=bar.time, side=OrderSide.SELL,
+                    entry_kind=OrderKind.STOP, entry=entry, sl=sl, tp=tp,
+                )
+        return None
+
+    return detector
+
+
 def detect_ny_momentum(
     day_bars: list[Bar], *, cash_open_hour: int = 13, cash_open_minute: int = 30,
 ) -> Signal | None:
@@ -244,7 +323,7 @@ class BacktestConfig:
     trail_r_step: float = 1.0
 
 
-def _default_detector(day_bars: list[Bar], config: "BacktestConfig") -> Signal | None:
+def _default_detector(day_bars: list[Bar], all_bars: list[Bar], config: "BacktestConfig") -> Signal | None:
     return detect_london_breakout(
         day_bars, min_range_pips=config.min_asian_range_pips, pip_size=config.pip_size,
     )
@@ -254,11 +333,11 @@ def run_backtest(
     bars: list[Bar], *, config: BacktestConfig = BacktestConfig(),
     detector=None,
 ) -> tuple[list[SimulatedTrade], list[tuple[datetime, float]]]:
-    """Walk M15 bars chronologically; return (trades, equity_curve_points).
+    """Walk bars chronologically; return (trades, equity_curve_points).
 
-    `detector` is a callable `(day_bars, config) -> Signal | None`. Default:
-    London Breakout. Pass `detect_ny_momentum` (wrapped if needed) to run
-    the NY Open Momentum setup instead.
+    `detector` is a callable `(day_bars, all_bars, config) -> Signal | None`.
+    Default: London Breakout. Use `detect_ny_momentum` or
+    `make_gold_pullback_detector(bars)` for the other setups.
     """
     if detector is None:
         detector = _default_detector
@@ -302,7 +381,7 @@ def run_backtest(
             and pending is None
             and not day_already_traded
         ):
-            sig = detector(by_day[current_day], config)
+            sig = detector(by_day[current_day], bars, config)
             if sig is not None and bar.time >= sig.signal_time:
                 pending = sig
                 pending_placed_at = bar.time
@@ -680,25 +759,30 @@ def main(argv: list[str] | None = None) -> int:
         help="Disable partial TPs + trailing SL (Phase 1 baseline behavior)",
     )
     parser.add_argument(
-        "--setup", choices=["london_breakout", "ny_momentum"],
+        "--setup", choices=["london_breakout", "ny_momentum", "gold_pullback"],
         default="london_breakout",
         help="Which playbook setup to backtest",
     )
     parser.add_argument(
+        "--timeframe", choices=["M15", "H1", "H4"], default="M15",
+        help="Bar timeframe (default M15; gold_pullback typically uses H1)",
+    )
+    parser.add_argument(
         "--pip-size", type=float,
-        help="Override pip size (default 0.0001 for FX, 1.0 for indices)",
+        help="Override pip size (default 0.0001 for FX, 1.0 for indices, 0.01 for XAUUSD)",
     )
     args = parser.parse_args(argv)
 
     start = datetime.fromisoformat(args.start).replace(tzinfo=UTC)
     end = datetime.fromisoformat(args.end).replace(tzinfo=UTC)
 
-    print(f"[backtest] loading {args.symbol} M15 bars from MT5 ({start.date()} -> {end.date()})...", file=sys.stderr)
-    bars = load_mt5_history(args.symbol, Timeframe.M15, start, end)
-    print(f"[backtest] loaded {len(bars)} M15 bars", file=sys.stderr)
-
-    # Sensible pip defaults: indices use 1.0 (points), FX uses 0.0001.
-    default_pip = 1.0 if args.symbol in {"US30", "NAS100", "SPX500", "GER40"} else 0.0001
+    # Sensible pip defaults per instrument class
+    if args.symbol in {"US30", "NAS100", "SPX500", "GER40", "USTEC", "US500"}:
+        default_pip = 1.0      # index points
+    elif args.symbol.startswith("XAU"):
+        default_pip = 0.01     # gold centi-dollar
+    else:
+        default_pip = 0.0001   # FX majors
     pip = args.pip_size if args.pip_size is not None else default_pip
 
     config = BacktestConfig(
@@ -710,11 +794,19 @@ def main(argv: list[str] | None = None) -> int:
         enable_manage_runners=not args.no_manage_runners,
     )
 
+    tf = Timeframe[args.timeframe]
+    print(f"[backtest] loading {args.symbol} {args.timeframe} bars from MT5 "
+          f"({start.date()} -> {end.date()})...", file=sys.stderr)
+    bars = load_mt5_history(args.symbol, tf, start, end)
+    print(f"[backtest] loaded {len(bars)} {args.timeframe} bars", file=sys.stderr)
+
     if args.setup == "london_breakout":
         detector = _default_detector
-    else:
-        def detector(day_bars, cfg):
+    elif args.setup == "ny_momentum":
+        def detector(day_bars, all_bars, cfg):
             return detect_ny_momentum(day_bars)
+    else:  # gold_pullback
+        detector = make_gold_pullback_detector(bars)
 
     print(f"[backtest] running simulation (setup={args.setup})...", file=sys.stderr)
     trades, equity_curve = run_backtest(bars, config=config, detector=detector)
