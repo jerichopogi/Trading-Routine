@@ -15,7 +15,7 @@ If any check fails, the order is rejected with a structured reason.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 
 from . import sessions
 from .account import compute_rule_status, read_equity_curve
@@ -73,9 +73,9 @@ def check_or_reject(
     now: datetime | None = None,
 ) -> GuardrailVerdict:
     """Evaluate every FundedNext + internal rule against this order."""
-    now = now or datetime.now(tz=None)
-    if now.tzinfo is None:
-        from datetime import UTC
+    if now is None:
+        now = datetime.now(UTC)
+    elif now.tzinfo is None:
         now = now.replace(tzinfo=UTC)
 
     cfg = fundednext()

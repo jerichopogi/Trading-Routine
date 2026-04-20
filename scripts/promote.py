@@ -23,7 +23,8 @@ PROMOTION_LOG = REPO_ROOT / "promotion.log"
 
 def _log(msg: str) -> None:
     line = f"{datetime.now(UTC).isoformat()}  {msg}\n"
-    PROMOTION_LOG.open("a", encoding="utf-8").write(line)
+    with PROMOTION_LOG.open("a", encoding="utf-8") as f:
+        f.write(line)
     print(line.rstrip())
 
 

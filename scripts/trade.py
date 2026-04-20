@@ -44,10 +44,12 @@ def place(
 
     # Stage gate: dev = never place real orders. Only mock broker runs in dev.
     if stage == "dev":
-        journal.log_order(
-            order=order, result=OrderResult(
-                ok=True, ticket=-1, price=None, message="dev stage — simulated", request=order,
-            ), stage=stage,
+        simulated = OrderResult(
+            ok=True, ticket=-1, price=None, message="dev stage — simulated", request=order,
+        )
+        journal.log_order(order=order, result=simulated, stage=stage)
+        return TradeOutcome(
+            placed=False, rejected=False, result=simulated, verdict=verdict, order=order,
         )
 
     result = broker.place_order(order)
