@@ -110,6 +110,24 @@ def test_risk_pct_for_respects_grade_and_override() -> None:
     assert decide.risk_pct_for("NAS100", ConvictionGrade.A) == 0.8
 
 
+def test_a_grade_drafted_order_passes_guardrail(mock_broker: MockBroker) -> None:
+    """Regression: draft_order must size against broker fill price (ask/bid),
+    not the LLM's intended entry, otherwise the spread pushes A-grade trades
+    over the 1% ceiling and the guardrail rejects them.
+    """
+    from scripts.guardrails import check_or_reject
+
+    for side in (OrderSide.BUY, OrderSide.SELL):
+        order = decide.draft_order(
+            symbol="EURUSD", side=side,
+            entry=1.07500, stop=1.07200 if side == OrderSide.BUY else 1.07800,
+            target=1.08100 if side == OrderSide.BUY else 1.06900,
+            broker=mock_broker, grade=ConvictionGrade.A,
+        )
+        verdict = check_or_reject(order, broker=mock_broker, now=WED_10_UTC)
+        assert verdict.ok, f"{side.value}: {verdict.reasons} meta={verdict.metadata}"
+
+
 def test_preflight_reports_state(mock_broker: MockBroker) -> None:
     report = decide.preflight(mock_broker, stage="demo", now=WED_10_UTC)
     assert report.stage == "demo"
