@@ -13,6 +13,7 @@ from scripts.backtest import (
     compute_stats,
     detect_london_breakout,
     detect_ny_momentum,
+    make_failed_breakout_fade_detector,
     make_gold_pullback_detector,
     run_backtest,
 )
@@ -365,6 +366,80 @@ def test_gold_pullback_no_signal_without_ema_context() -> None:
     detector = make_gold_pullback_detector(bars)
     sig = detector(day_bars, bars, BacktestConfig(symbol="XAUUSD", pip_size=0.01))
     assert sig is None
+
+
+# ---------- make_failed_breakout_fade_detector ----------
+
+
+def test_fade_bearish_signal_when_high_swept_and_bar_closes_bearish() -> None:
+    """Sweep recent high, close back inside, bearish candle → SELL MARKET."""
+    t0 = datetime(2026, 4, 20, 0, 0, tzinfo=UTC)
+    h4 = timedelta(hours=4)
+    bars: list[Bar] = []
+    # 12 H4 bars with high near 1.1800
+    for i in range(12):
+        bars.append(_bar(t0 + h4 * i, 1.17800, 1.17950, 1.17600, 1.17800))
+    # Current bar: wicks above 1.17950 then closes back below with bearish body
+    bars.append(_bar(t0 + h4 * 12, 1.17900, 1.18100, 1.17700, 1.17700))
+
+    day_bars = [bars[-1]]
+    detector = make_failed_breakout_fade_detector(bars)
+    sig = detector(day_bars, bars, BacktestConfig(pip_size=0.0001))
+    assert sig is not None
+    assert sig.side == OrderSide.SELL
+    assert sig.entry_kind == OrderKind.MARKET
+    assert sig.entry == 1.17700
+    assert sig.sl > bars[-1].high  # SL above swept high + buffer
+
+
+def test_fade_bullish_signal_when_low_swept_and_bar_closes_bullish() -> None:
+    t0 = datetime(2026, 4, 20, 0, 0, tzinfo=UTC)
+    h4 = timedelta(hours=4)
+    bars: list[Bar] = []
+    for i in range(12):
+        bars.append(_bar(t0 + h4 * i, 1.17800, 1.17950, 1.17600, 1.17800))
+    bars.append(_bar(t0 + h4 * 12, 1.17700, 1.17900, 1.17500, 1.17900))  # wick below 1.17600, bullish close
+
+    day_bars = [bars[-1]]
+    detector = make_failed_breakout_fade_detector(bars)
+    sig = detector(day_bars, bars, BacktestConfig(pip_size=0.0001))
+    assert sig is not None
+    assert sig.side == OrderSide.BUY
+
+
+def test_fade_no_signal_when_bar_does_not_sweep_window() -> None:
+    t0 = datetime(2026, 4, 20, 0, 0, tzinfo=UTC)
+    h4 = timedelta(hours=4)
+    bars: list[Bar] = []
+    for i in range(12):
+        bars.append(_bar(t0 + h4 * i, 1.17800, 1.17950, 1.17600, 1.17800))
+    # Current bar stays inside the window
+    bars.append(_bar(t0 + h4 * 12, 1.17800, 1.17850, 1.17750, 1.17820))
+
+    day_bars = [bars[-1]]
+    detector = make_failed_breakout_fade_detector(bars)
+    assert detector(day_bars, bars, BacktestConfig(pip_size=0.0001)) is None
+
+
+def test_simulator_market_entry_fills_at_next_bar_open() -> None:
+    """A MARKET signal fills at the first subsequent bar's open price."""
+    t0 = datetime(2026, 4, 22, 0, 0, tzinfo=UTC)
+    h4 = timedelta(hours=4)
+    bars: list[Bar] = []
+    for i in range(12):
+        bars.append(_bar(t0 + h4 * i, 1.17800, 1.17950, 1.17600, 1.17800))
+    # Signal bar: swept + bearish close
+    bars.append(_bar(t0 + h4 * 12, 1.17900, 1.18100, 1.17700, 1.17700))
+    # Follow-through bar (fills the market order at its open); then drops to TP
+    bars.append(_bar(t0 + h4 * 13, 1.17700, 1.17720, 1.16500, 1.16600))  # big drop
+
+    detector = make_failed_breakout_fade_detector(bars)
+    config = BacktestConfig(pip_size=0.0001, enable_manage_runners=False)
+    trades, _ = run_backtest(bars, config=config, detector=detector)
+    filled = [t for t in trades if t.entry_fill is not None]
+    assert len(filled) == 1
+    assert filled[0].setup == "failed_breakout_fade"
+    assert filled[0].side == "sell"
 
 
 def test_manage_runners_toggle_changes_result() -> None:

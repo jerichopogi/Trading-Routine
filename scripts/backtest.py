@@ -220,6 +220,70 @@ def make_gold_pullback_detector(all_bars: list[Bar]):
     return detector
 
 
+def make_failed_breakout_fade_detector(
+    all_bars: list[Bar], *, lookback_bars: int = 12, stop_buffer_pips: float = 5.0,
+):
+    """Build a detector closure for FX Failed-Breakout Fade (playbook #4).
+
+    Approximation of the playbook rule:
+      - Over the last `lookback_bars` (H4 bars = 48 hours), find the highest
+        high (recent resistance). If the CURRENT bar's HIGH exceeded that
+        level but its CLOSE is back BELOW it AND the bar is bearish
+        (close < open) -> bearish fade. Mirror for bullish fade.
+      - Entry: MARKET at bar close
+      - SL: the break-extreme + `stop_buffer_pips` * pip_size
+      - TP: entry +/- 2R
+
+    Simplifications vs playbook:
+      - Uses N-bar lookback high/low, not formal swing pivots
+      - "Within 2 hours" simplified to "within the same bar" (break-and-reclaim
+        intrabar). Works for H4 bars, less meaningful on lower timeframes.
+      - No "first hour of London/NY" filter
+    """
+    idx_by_time = {b.time: i for i, b in enumerate(all_bars)}
+
+    def detector(day_bars: list[Bar], _all_bars: list[Bar], config: "BacktestConfig") -> Signal | None:
+        buf = stop_buffer_pips * config.pip_size
+        for bar in day_bars:
+            i = idx_by_time.get(bar.time)
+            if i is None or i < lookback_bars:
+                continue
+            # Lookback window ends at the bar BEFORE current
+            window = all_bars[i - lookback_bars:i]
+            window_high = max(b.high for b in window)
+            window_low = min(b.low for b in window)
+            bearish = bar.close < bar.open
+            bullish = bar.close > bar.open
+
+            # Bearish fade: swept recent high, closed back below, bearish bar
+            if bar.high > window_high and bar.close < window_high and bearish:
+                sl = bar.high + buf
+                risk = sl - bar.close
+                if risk <= 0:
+                    continue
+                tp = bar.close - 2.0 * risk
+                return Signal(
+                    setup="failed_breakout_fade", signal_time=bar.time,
+                    side=OrderSide.SELL, entry_kind=OrderKind.MARKET,
+                    entry=bar.close, sl=sl, tp=tp,
+                )
+            # Bullish fade: swept recent low, closed back above, bullish bar
+            if bar.low < window_low and bar.close > window_low and bullish:
+                sl = bar.low - buf
+                risk = bar.close - sl
+                if risk <= 0:
+                    continue
+                tp = bar.close + 2.0 * risk
+                return Signal(
+                    setup="failed_breakout_fade", signal_time=bar.time,
+                    side=OrderSide.BUY, entry_kind=OrderKind.MARKET,
+                    entry=bar.close, sl=sl, tp=tp,
+                )
+        return None
+
+    return detector
+
+
 def detect_ny_momentum(
     day_bars: list[Bar], *, cash_open_hour: int = 13, cash_open_minute: int = 30,
 ) -> Signal | None:
@@ -484,18 +548,27 @@ def run_backtest(
                 ) or (
                     pending.side == OrderSide.SELL and bar.high >= pending.entry
                 )
-            else:  # STOP
+                market_fill = False
+            elif pending.entry_kind == OrderKind.STOP:
                 triggered = (
                     pending.side == OrderSide.BUY and bar.high >= pending.entry
                 ) or (
                     pending.side == OrderSide.SELL and bar.low <= pending.entry
                 )
+                market_fill = False
+            else:  # MARKET — fills immediately at the first bar we see at/after signal_time
+                triggered = bar.time >= pending.signal_time
+                market_fill = True
             if triggered:
-                fill = (
-                    pending.entry + spread
-                    if pending.side == OrderSide.BUY
-                    else pending.entry - spread
-                )
+                if market_fill:
+                    # For MARKET entries, fill at this bar's open (± spread)
+                    fill = bar.open + spread if pending.side == OrderSide.BUY else bar.open - spread
+                else:
+                    fill = (
+                        pending.entry + spread
+                        if pending.side == OrderSide.BUY
+                        else pending.entry - spread
+                    )
                 open_trade = SimulatedTrade(
                     symbol=config.symbol,
                     side=pending.side.value,
@@ -759,7 +832,8 @@ def main(argv: list[str] | None = None) -> int:
         help="Disable partial TPs + trailing SL (Phase 1 baseline behavior)",
     )
     parser.add_argument(
-        "--setup", choices=["london_breakout", "ny_momentum", "gold_pullback"],
+        "--setup",
+        choices=["london_breakout", "ny_momentum", "gold_pullback", "failed_breakout_fade"],
         default="london_breakout",
         help="Which playbook setup to backtest",
     )
@@ -781,6 +855,8 @@ def main(argv: list[str] | None = None) -> int:
         default_pip = 1.0      # index points
     elif args.symbol.startswith("XAU"):
         default_pip = 0.01     # gold centi-dollar
+    elif "JPY" in args.symbol:
+        default_pip = 0.01     # JPY pairs quote with 3 decimals
     else:
         default_pip = 0.0001   # FX majors
     pip = args.pip_size if args.pip_size is not None else default_pip
@@ -805,8 +881,10 @@ def main(argv: list[str] | None = None) -> int:
     elif args.setup == "ny_momentum":
         def detector(day_bars, all_bars, cfg):
             return detect_ny_momentum(day_bars)
-    else:  # gold_pullback
+    elif args.setup == "gold_pullback":
         detector = make_gold_pullback_detector(bars)
+    else:  # failed_breakout_fade
+        detector = make_failed_breakout_fade_detector(bars)
 
     print(f"[backtest] running simulation (setup={args.setup})...", file=sys.stderr)
     trades, equity_curve = run_backtest(bars, config=config, detector=detector)
