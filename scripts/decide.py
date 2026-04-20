@@ -180,13 +180,21 @@ def draft_order(
       - A ("very good" setup — 5/5 rubric): up to per_trade_risk_pct_max
       - B ("okay" setup, default): per_trade_risk_pct
 
+    Sizing uses the broker's current fill price (ask for buy, bid for sell)
+    rather than the LLM's intended `entry`, because the guardrail evaluates
+    actual risk against that same fill price. Using intended entry here would
+    under-estimate distance-to-stop by the spread and the guardrail would
+    reject A-grade trades sized to the ceiling. The `entry` argument is kept
+    for signature symmetry with the routine's draft narrative.
+
     The guardrail layer still enforces the MAX as a hard ceiling regardless.
     """
     risk_pct = risk_pct_for(symbol, grade)
     info = broker.account_info()
     sym = broker.symbol_info(symbol)
+    fill_price = sym.ask if side == OrderSide.BUY else sym.bid
     volume = size_by_risk(
-        symbol=symbol, entry=entry, stop=stop,
+        symbol=symbol, entry=fill_price, stop=stop,
         balance=info.balance, risk_pct=risk_pct,
         contract_size=sym.contract_size,
     )
