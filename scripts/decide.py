@@ -208,18 +208,31 @@ def draft_order(
     current price, LIMIT if entry is on the favorable side (pullback), STOP if
     on the unfavorable side (breakout). Pass an explicit kind to override.
 
+    Sizing reference depends on kind:
+      - MARKET: uses the broker's current ask/bid (actual fill price), so the
+        guardrail's risk calculation against that same fill price matches the
+        sized volume. Using intended entry here would under-estimate distance
+        by the spread and cause A-grade trades to be rejected at the ceiling.
+      - LIMIT / STOP: uses the requested `entry` because the broker guarantees
+        the fill at that price. The `_PendingRiskBroker` in trade.py mirrors
+        this by feeding the guardrail entry-as-fill-price for pending orders.
+
     The guardrail layer still enforces the MAX as a hard ceiling regardless.
     """
     risk_pct = risk_pct_for(symbol, grade)
     info = broker.account_info()
     sym = broker.symbol_info(symbol)
+    if kind is None:
+        kind = classify_entry(side=side, entry=entry, bid=sym.bid, ask=sym.ask)
+    if kind == OrderKind.MARKET:
+        sizing_ref = sym.ask if side == OrderSide.BUY else sym.bid
+    else:
+        sizing_ref = entry
     volume = size_by_risk(
-        symbol=symbol, entry=entry, stop=stop,
+        symbol=symbol, entry=sizing_ref, stop=stop,
         balance=info.balance, risk_pct=risk_pct,
         contract_size=sym.contract_size,
     )
-    if kind is None:
-        kind = classify_entry(side=side, entry=entry, bid=sym.bid, ask=sym.ask)
     # Tag the comment with the grade so we can analyze performance by conviction later.
     graded_comment = f"{comment}|{grade.value}"[:31] if comment else f"grade:{grade.value}"
     return OrderRequest(

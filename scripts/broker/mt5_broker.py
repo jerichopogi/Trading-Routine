@@ -59,20 +59,34 @@ class Mt5Broker:
         })
 
         terminal_path = os.environ.get("MT5_TERMINAL_PATH") or None
-        init_kwargs: dict[str, Any] = {}
-        if terminal_path:
-            init_kwargs["path"] = terminal_path
-
-        login = os.environ.get("MT5_LOGIN")
+        login_env = os.environ.get("MT5_LOGIN")
         password = os.environ.get("MT5_PASSWORD")
         server = os.environ.get("MT5_SERVER")
+        expected_login = int(login_env) if login_env else None
 
-        if login and password and server:
-            init_kwargs.update(login=int(login), password=password, server=server)
+        attach_kwargs: dict[str, Any] = {}
+        if terminal_path:
+            attach_kwargs["path"] = terminal_path
 
-        if not mt5.initialize(**init_kwargs):
-            err = mt5.last_error()
-            raise RuntimeError(f"MT5 initialize failed: {err}")
+        attached = mt5.initialize(**attach_kwargs)
+        if attached and expected_login is not None:
+            info = mt5.account_info()
+            if info is None or info.login != expected_login:
+                mt5.shutdown()
+                attached = False
+
+        if not attached:
+            if not (expected_login and password and server):
+                err = mt5.last_error()
+                raise RuntimeError(
+                    f"MT5 initialize failed: {err}. Ensure the terminal is "
+                    "running and logged in, or set MT5_LOGIN/MT5_PASSWORD/MT5_SERVER."
+                )
+            login_kwargs = dict(attach_kwargs)
+            login_kwargs.update(login=expected_login, password=password, server=server)
+            if not mt5.initialize(**login_kwargs):
+                err = mt5.last_error()
+                raise RuntimeError(f"MT5 initialize failed: {err}")
 
         self._connected = True
 
@@ -174,7 +188,7 @@ class Mt5Broker:
             "magic": order.magic,
             "comment": order.comment[:31],
             "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC,
+            "type_filling": self._pick_filling(order.symbol),
         }
         result = mt5.order_send(request)
         if result is None:
@@ -331,7 +345,7 @@ class Mt5Broker:
             "magic": pos.magic,
             "comment": "close",
             "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC,
+            "type_filling": self._pick_filling(pos.symbol),
         }
         result = mt5.order_send(request)
         return bool(result and result.retcode == mt5.TRADE_RETCODE_DONE)
@@ -358,3 +372,13 @@ class Mt5Broker:
     def _ensure(self) -> None:
         if not self._connected:
             self.connect()
+
+    def _pick_filling(self, symbol: str) -> int:
+        mt5 = self._mt5
+        si = mt5.symbol_info(symbol)
+        mask = getattr(si, "filling_mode", 0) if si else 0
+        if mask & 1:
+            return mt5.ORDER_FILLING_FOK
+        if mask & 2:
+            return mt5.ORDER_FILLING_IOC
+        return mt5.ORDER_FILLING_RETURN
