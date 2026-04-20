@@ -103,6 +103,16 @@ def log_close(position: Position, ok: bool, reason: str, stage: str) -> None:
     })
 
 
+def log_cancel_pending(ticket: int, symbol: str, reason: str) -> None:
+    _append_jsonl(_trade_log_path(), {
+        "event": "cancel_pending",
+        "ts": datetime.now(UTC).isoformat(),
+        "ticket": ticket,
+        "symbol": symbol,
+        "reason": reason,
+    })
+
+
 # ----- human-readable markdown journals -----
 
 def append_daily_note(section: str, body: str, d: date | None = None) -> Path:

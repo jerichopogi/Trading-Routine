@@ -29,7 +29,7 @@ from enum import StrEnum
 
 from . import sessions as session_clock
 from .account import compute_rule_status, read_equity_curve
-from .broker import Broker, OrderRequest, OrderSide
+from .broker import Broker, OrderKind, OrderRequest, OrderSide
 from .config import fundednext, instruments
 
 
@@ -163,6 +163,29 @@ def risk_pct_for(symbol: str, grade: ConvictionGrade) -> float:
     )
 
 
+def classify_entry(
+    *, side: OrderSide, entry: float, bid: float, ask: float, tolerance: float | None = None,
+) -> OrderKind:
+    """Decide MARKET / LIMIT / STOP by comparing entry to current bid/ask.
+
+    Tolerance defaults to spread × 2 so entries that are "at market" after a
+    tick-level wiggle still route as MARKET. Beyond that, direction decides:
+
+      BUY  + entry < bid  → LIMIT (pullback to buy zone)
+      BUY  + entry > ask  → STOP  (buy on breakout)
+      SELL + entry > ask  → LIMIT (rally to sell zone)
+      SELL + entry < bid  → STOP  (sell on breakdown)
+    """
+    spread = max(ask - bid, 0.0)
+    tol = tolerance if tolerance is not None else max(spread * 2.0, 1e-9)
+    reference = ask if side == OrderSide.BUY else bid
+    if abs(entry - reference) <= tol:
+        return OrderKind.MARKET
+    if side == OrderSide.BUY:
+        return OrderKind.LIMIT if entry < bid else OrderKind.STOP
+    return OrderKind.LIMIT if entry > ask else OrderKind.STOP
+
+
 def draft_order(
     *,
     symbol: str,
@@ -173,12 +196,17 @@ def draft_order(
     broker: Broker,
     grade: ConvictionGrade = ConvictionGrade.B,
     comment: str = "",
+    kind: OrderKind | None = None,
 ) -> OrderRequest:
     """Compose an OrderRequest with volume sized to per-trade risk config.
 
     `grade` picks which risk % to use:
       - A ("very good" setup — 5/5 rubric): up to per_trade_risk_pct_max
       - B ("okay" setup, default): per_trade_risk_pct
+
+    `kind` defaults to auto-classify via `classify_entry()`: MARKET if entry ≈
+    current price, LIMIT if entry is on the favorable side (pullback), STOP if
+    on the unfavorable side (breakout). Pass an explicit kind to override.
 
     The guardrail layer still enforces the MAX as a hard ceiling regardless.
     """
@@ -190,9 +218,13 @@ def draft_order(
         balance=info.balance, risk_pct=risk_pct,
         contract_size=sym.contract_size,
     )
+    if kind is None:
+        kind = classify_entry(side=side, entry=entry, bid=sym.bid, ask=sym.ask)
     # Tag the comment with the grade so we can analyze performance by conviction later.
     graded_comment = f"{comment}|{grade.value}"[:31] if comment else f"grade:{grade.value}"
     return OrderRequest(
         symbol=symbol, side=side, volume=volume,
         sl=stop, tp=target, comment=graded_comment,
+        kind=kind,
+        entry=entry if kind != OrderKind.MARKET else None,
     )

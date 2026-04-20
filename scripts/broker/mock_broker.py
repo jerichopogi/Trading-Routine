@@ -14,9 +14,11 @@ from .base import (
     AccountInfo,
     Bar,
     BrokerState,
+    OrderKind,
     OrderRequest,
     OrderResult,
     OrderSide,
+    PendingOrder,
     Position,
     SymbolInfo,
     Timeframe,
@@ -85,6 +87,7 @@ class MockBroker:
 
     def set_price(self, symbol: str, bid: float, ask: float) -> None:
         self._prices[symbol] = (bid, ask)
+        self._fill_triggered_pending(symbol, bid, ask)
         self._revalue_positions()
 
     def set_clock(self, now: datetime) -> None:
@@ -130,6 +133,9 @@ class MockBroker:
     def positions(self) -> list[Position]:
         return list(self._state.positions)
 
+    def pending_orders(self) -> list[PendingOrder]:
+        return list(self._state.pending_orders)
+
     def place_order(self, order: OrderRequest) -> OrderResult:
         if not self._connected:
             self.connect()
@@ -138,6 +144,35 @@ class MockBroker:
                 ok=False, ticket=None, price=None,
                 message=f"Unknown symbol {order.symbol}", request=order,
             )
+
+        if order.kind != OrderKind.MARKET:
+            if order.entry is None:
+                return OrderResult(
+                    ok=False, ticket=None, price=None,
+                    message=f"{order.kind.value} order requires entry price", request=order,
+                )
+            ticket = self._state.next_ticket
+            self._state.next_ticket += 1
+            pending = PendingOrder(
+                ticket=ticket,
+                symbol=order.symbol,
+                side=order.side,
+                kind=order.kind,
+                volume=order.volume,
+                entry=order.entry,
+                sl=order.sl,
+                tp=order.tp,
+                time_placed=self._clock or datetime.now(UTC),
+                expires_at=order.expires_at,
+                comment=order.comment,
+                magic=order.magic,
+            )
+            self._state.pending_orders.append(pending)
+            return OrderResult(
+                ok=True, ticket=ticket, price=order.entry,
+                message=f"pending {order.kind.value}", request=order,
+            )
+
         bid, ask = self._prices[order.symbol]
         fill = ask if order.side == OrderSide.BUY else bid
         ticket = self._state.next_ticket
@@ -159,6 +194,13 @@ class MockBroker:
         )
         self._state.positions.append(position)
         return OrderResult(ok=True, ticket=ticket, price=fill, message="ok", request=order)
+
+    def cancel_pending_order(self, ticket: int) -> bool:
+        for i, po in enumerate(self._state.pending_orders):
+            if po.ticket == ticket:
+                self._state.pending_orders.pop(i)
+                return True
+        return False
 
     def modify_position(
         self, ticket: int, sl: float | None = None, tp: float | None = None
@@ -207,6 +249,57 @@ class MockBroker:
         ]
 
     # ----- internal -----
+
+    def _fill_triggered_pending(self, symbol: str, bid: float, ask: float) -> None:
+        """Check all pending orders on this symbol; fill any whose trigger hit.
+
+        Triggers (standard MT5 semantics):
+          BUY  LIMIT: fills when ask <= entry  (pullback into buy level)
+          SELL LIMIT: fills when bid >= entry  (rally into sell level)
+          BUY  STOP:  fills when ask >= entry  (breakout above)
+          SELL STOP:  fills when bid <= entry  (breakdown below)
+        """
+        now = self._clock or datetime.now(UTC)
+        remaining: list[PendingOrder] = []
+        for po in self._state.pending_orders:
+            if po.symbol != symbol:
+                remaining.append(po)
+                continue
+            triggered = False
+            fill_price = po.entry
+            if po.side == OrderSide.BUY and po.kind == OrderKind.LIMIT:
+                triggered = ask <= po.entry
+                fill_price = min(ask, po.entry)
+            elif po.side == OrderSide.SELL and po.kind == OrderKind.LIMIT:
+                triggered = bid >= po.entry
+                fill_price = max(bid, po.entry)
+            elif po.side == OrderSide.BUY and po.kind == OrderKind.STOP:
+                triggered = ask >= po.entry
+                fill_price = max(ask, po.entry)
+            elif po.side == OrderSide.SELL and po.kind == OrderKind.STOP:
+                triggered = bid <= po.entry
+                fill_price = min(bid, po.entry)
+
+            if not triggered:
+                remaining.append(po)
+                continue
+
+            self._state.positions.append(Position(
+                ticket=po.ticket,
+                symbol=po.symbol,
+                side=po.side,
+                volume=po.volume,
+                price_open=fill_price,
+                price_current=fill_price,
+                sl=po.sl,
+                tp=po.tp,
+                profit=0.0,
+                swap=0.0,
+                time_open=now,
+                comment=po.comment,
+                magic=po.magic,
+            ))
+        self._state.pending_orders = remaining
 
     def _revalue_positions(self) -> None:
         new_positions: list[Position] = []

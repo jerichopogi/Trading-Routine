@@ -14,9 +14,11 @@ from typing import Any
 from .base import (
     AccountInfo,
     Bar,
+    OrderKind,
     OrderRequest,
     OrderResult,
     OrderSide,
+    PendingOrder,
     Position,
     SymbolInfo,
     Timeframe,
@@ -149,6 +151,9 @@ class Mt5Broker:
                 message="ALLOW_LIVE_ORDERS!=1 (dry-run)", request=order,
             )
 
+        if order.kind != OrderKind.MARKET:
+            return self._place_pending(order)
+
         mt5 = self._mt5
         tick = mt5.symbol_info_tick(order.symbol)
         if tick is None:
@@ -185,6 +190,106 @@ class Mt5Broker:
             message=f"retcode={result.retcode} {result.comment}",
             request=order,
         )
+
+    def _place_pending(self, order: OrderRequest) -> OrderResult:
+        mt5 = self._mt5
+        if order.entry is None:
+            return OrderResult(
+                ok=False, ticket=None, price=None,
+                message=f"{order.kind.value} order requires entry price", request=order,
+            )
+        mt5_type = self._pending_mt5_type(order.kind, order.side)
+        if mt5_type is None:
+            return OrderResult(
+                ok=False, ticket=None, price=None,
+                message=f"unsupported pending combo {order.kind.value}/{order.side.value}",
+                request=order,
+            )
+        req: dict[str, Any] = {
+            "action": mt5.TRADE_ACTION_PENDING,
+            "symbol": order.symbol,
+            "volume": order.volume,
+            "type": mt5_type,
+            "price": order.entry,
+            "sl": order.sl or 0.0,
+            "tp": order.tp or 0.0,
+            "deviation": 20,
+            "magic": order.magic,
+            "comment": order.comment[:31],
+            "type_filling": mt5.ORDER_FILLING_RETURN,
+        }
+        if order.expires_at is not None:
+            req["type_time"] = mt5.ORDER_TIME_SPECIFIED
+            req["expiration"] = int(order.expires_at.timestamp())
+        else:
+            req["type_time"] = mt5.ORDER_TIME_GTC
+        result = mt5.order_send(req)
+        if result is None:
+            return OrderResult(
+                ok=False, ticket=None, price=None,
+                message=f"order_send returned None: {mt5.last_error()}", request=order,
+            )
+        ok = result.retcode == mt5.TRADE_RETCODE_DONE
+        return OrderResult(
+            ok=ok,
+            ticket=result.order if ok else None,
+            price=order.entry if ok else None,
+            message=f"retcode={result.retcode} {result.comment}",
+            request=order,
+        )
+
+    def _pending_mt5_type(self, kind: OrderKind, side: OrderSide) -> int | None:
+        mt5 = self._mt5
+        mapping = {
+            (OrderKind.LIMIT, OrderSide.BUY):  mt5.ORDER_TYPE_BUY_LIMIT,
+            (OrderKind.LIMIT, OrderSide.SELL): mt5.ORDER_TYPE_SELL_LIMIT,
+            (OrderKind.STOP,  OrderSide.BUY):  mt5.ORDER_TYPE_BUY_STOP,
+            (OrderKind.STOP,  OrderSide.SELL): mt5.ORDER_TYPE_SELL_STOP,
+        }
+        return mapping.get((kind, side))
+
+    def pending_orders(self) -> list[PendingOrder]:
+        self._ensure()
+        mt5 = self._mt5
+        raw = mt5.orders_get() or []
+        out: list[PendingOrder] = []
+        type_map = {
+            mt5.ORDER_TYPE_BUY_LIMIT:  (OrderKind.LIMIT, OrderSide.BUY),
+            mt5.ORDER_TYPE_SELL_LIMIT: (OrderKind.LIMIT, OrderSide.SELL),
+            mt5.ORDER_TYPE_BUY_STOP:   (OrderKind.STOP,  OrderSide.BUY),
+            mt5.ORDER_TYPE_SELL_STOP:  (OrderKind.STOP,  OrderSide.SELL),
+        }
+        for r in raw:
+            classified = type_map.get(r.type)
+            if classified is None:
+                continue
+            kind, side = classified
+            vol = getattr(r, "volume_current", None) or getattr(r, "volume_initial", 0.0)
+            out.append(PendingOrder(
+                ticket=r.ticket,
+                symbol=r.symbol,
+                side=side,
+                kind=kind,
+                volume=vol,
+                entry=r.price_open,
+                sl=r.sl or None,
+                tp=r.tp or None,
+                time_placed=datetime.fromtimestamp(r.time_setup, tz=UTC),
+                expires_at=(
+                    datetime.fromtimestamp(r.time_expiration, tz=UTC)
+                    if r.time_expiration else None
+                ),
+                comment=r.comment,
+                magic=r.magic,
+            ))
+        return out
+
+    def cancel_pending_order(self, ticket: int) -> bool:
+        self._ensure()
+        mt5 = self._mt5
+        req = {"action": mt5.TRADE_ACTION_REMOVE, "order": ticket}
+        result = mt5.order_send(req)
+        return bool(result and result.retcode == mt5.TRADE_RETCODE_DONE)
 
     def modify_position(
         self, ticket: int, sl: float | None = None, tp: float | None = None

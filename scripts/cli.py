@@ -98,6 +98,42 @@ def cmd_flatten(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_pending(args: argparse.Namespace) -> int:
+    broker = get_broker()
+    broker.connect()
+    try:
+        pending = broker.pending_orders()
+    finally:
+        broker.disconnect()
+    if args.json:
+        print(json.dumps([asdict(p) for p in pending], indent=2, default=str))
+        return 0
+    if not pending:
+        print("(no pending orders)")
+        return 0
+    for p in pending:
+        print(
+            f"#{p.ticket} {p.symbol} {p.side.value} {p.kind.value} "
+            f"vol={p.volume} entry={p.entry} sl={p.sl} tp={p.tp}"
+        )
+    return 0
+
+
+def cmd_cancel_pending(args: argparse.Namespace) -> int:
+    broker = get_broker()
+    broker.connect()
+    try:
+        if args.ticket is not None:
+            ok = broker.cancel_pending_order(args.ticket)
+            print(f"Cancel #{args.ticket}: {'ok' if ok else 'not found'}")
+            return 0 if ok else 1
+        cancelled = trade.cancel_all_pending(broker, reason=args.reason)
+    finally:
+        broker.disconnect()
+    print(f"Cancelled {len(cancelled)} pending orders: {cancelled}")
+    return 0
+
+
 def cmd_breakeven(args: argparse.Namespace) -> int:
     broker = get_broker()
     broker.connect()
@@ -214,6 +250,15 @@ def build_parser() -> argparse.ArgumentParser:
     be = sub.add_parser("breakeven")
     be.add_argument("--min-r", type=float, default=1.0, dest="min_r")
     be.set_defaults(func=cmd_breakeven)
+
+    pd = sub.add_parser("pending", help="List pending (unfilled) orders")
+    pd.add_argument("--json", action="store_true")
+    pd.set_defaults(func=cmd_pending)
+
+    cp = sub.add_parser("cancel-pending", help="Cancel pending orders (one by ticket or all)")
+    cp.add_argument("--ticket", type=int, help="Cancel a specific ticket; omit to cancel all")
+    cp.add_argument("--reason", default="manual", help="Reason logged for --all cancellations")
+    cp.set_defaults(func=cmd_cancel_pending)
 
     ss = sub.add_parser("session-status")
     ss.add_argument("symbol")

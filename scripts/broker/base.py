@@ -17,6 +17,12 @@ class OrderSide(StrEnum):
     SELL = "sell"
 
 
+class OrderKind(StrEnum):
+    MARKET = "market"  # fill at current bid/ask
+    LIMIT = "limit"    # wait for price to pull back to entry (better than current)
+    STOP = "stop"      # wait for price to break past entry (worse than current)
+
+
 class Timeframe(StrEnum):
     M1 = "M1"
     M5 = "M5"
@@ -68,6 +74,9 @@ class OrderRequest:
     tp: float | None = None    # take profit (price)
     comment: str = ""
     magic: int = 424242        # identifies trades placed by this agent
+    kind: OrderKind = OrderKind.MARKET
+    entry: float | None = None          # required when kind != MARKET
+    expires_at: datetime | None = None  # optional expiry for pending orders
 
 
 @dataclass(frozen=True)
@@ -111,6 +120,23 @@ class Position:
         return move / risk_per_unit
 
 
+@dataclass(frozen=True)
+class PendingOrder:
+    """A submitted-but-unfilled limit/stop order sitting on the broker."""
+    ticket: int
+    symbol: str
+    side: OrderSide
+    kind: OrderKind
+    volume: float
+    entry: float
+    sl: float | None
+    tp: float | None
+    time_placed: datetime
+    expires_at: datetime | None = None
+    comment: str = ""
+    magic: int = 0
+
+
 class Broker(Protocol):
     """Protocol implemented by MockBroker and Mt5Broker."""
 
@@ -119,11 +145,13 @@ class Broker(Protocol):
     def account_info(self) -> AccountInfo: ...
     def symbol_info(self, symbol: str) -> SymbolInfo: ...
     def positions(self) -> list[Position]: ...
+    def pending_orders(self) -> list[PendingOrder]: ...
     def place_order(self, order: OrderRequest) -> OrderResult: ...
     def modify_position(
         self, ticket: int, sl: float | None = None, tp: float | None = None
     ) -> bool: ...
     def close_position(self, ticket: int) -> bool: ...
+    def cancel_pending_order(self, ticket: int) -> bool: ...
     def rates(self, symbol: str, tf: Timeframe, count: int) -> list[Bar]: ...
 
 
@@ -132,5 +160,6 @@ class BrokerState:
     """Shared scratch state used by the mock and available to tests."""
 
     positions: list[Position] = field(default_factory=list)
+    pending_orders: list[PendingOrder] = field(default_factory=list)
     closed_positions: list[Position] = field(default_factory=list)
     next_ticket: int = 10_000
