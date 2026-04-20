@@ -113,6 +113,22 @@ def log_cancel_pending(ticket: int, symbol: str, reason: str) -> None:
     })
 
 
+def log_partial_close(
+    ticket: int, symbol: str, volume_closed: float, realized_r: float | None,
+    remaining_volume: float, reason: str,
+) -> None:
+    _append_jsonl(_trade_log_path(), {
+        "event": "partial_close",
+        "ts": datetime.now(UTC).isoformat(),
+        "ticket": ticket,
+        "symbol": symbol,
+        "volume_closed": volume_closed,
+        "realized_r": realized_r,
+        "remaining_volume": remaining_volume,
+        "reason": reason,
+    })
+
+
 # ----- human-readable markdown journals -----
 
 def append_daily_note(section: str, body: str, d: date | None = None) -> Path:

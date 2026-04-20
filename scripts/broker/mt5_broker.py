@@ -305,6 +305,38 @@ class Mt5Broker:
         result = mt5.order_send(req)
         return bool(result and result.retcode == mt5.TRADE_RETCODE_DONE)
 
+    def partial_close_position(self, ticket: int, volume_to_close: float) -> bool:
+        self._ensure()
+        mt5 = self._mt5
+        pos = next((p for p in self.positions() if p.ticket == ticket), None)
+        if pos is None or volume_to_close <= 0:
+            return False
+        close_vol = min(volume_to_close, pos.volume)
+        # Respect broker lot step (round DOWN to 2 decimals, standard MT5 step)
+        close_vol = int(close_vol * 100) / 100
+        if close_vol < 0.01:
+            return False
+        tick = mt5.symbol_info_tick(pos.symbol)
+        if tick is None:
+            return False
+        close_side = mt5.ORDER_TYPE_SELL if pos.side == OrderSide.BUY else mt5.ORDER_TYPE_BUY
+        price = tick.bid if pos.side == OrderSide.BUY else tick.ask
+        req = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": pos.symbol,
+            "volume": close_vol,
+            "type": close_side,
+            "position": ticket,
+            "price": price,
+            "deviation": 20,
+            "magic": pos.magic,
+            "comment": "partial",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+        result = mt5.order_send(req)
+        return bool(result and result.retcode == mt5.TRADE_RETCODE_DONE)
+
     def modify_position(
         self, ticket: int, sl: float | None = None, tp: float | None = None
     ) -> bool:
