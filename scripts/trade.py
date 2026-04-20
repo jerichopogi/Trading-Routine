@@ -82,13 +82,31 @@ def place(
     journal.log_order(order=order, result=result, stage=stage)
 
     if result.ok:
-        notify.info(
-            title=f"Trade placed: {order.symbol} {order.side.value} {order.volume}",
-            body=(
-                f"entry={result.price} sl={order.sl} tp={order.tp}\n"
-                f"ticket={result.ticket} comment={order.comment}"
-            ),
-        )
+        if order.kind == OrderKind.MARKET:
+            title = f"Trade placed (market): {order.symbol} {order.side.value} {order.volume}"
+            body = (
+                f"filled at {result.price}\n"
+                f"sl={order.sl}  tp={order.tp}\n"
+                f"ticket={result.ticket}  comment={order.comment}"
+            )
+        else:
+            trigger = (
+                "ask <= entry (pullback)" if (order.kind == OrderKind.LIMIT and order.side == OrderSide.BUY)
+                else "bid >= entry (rally)" if (order.kind == OrderKind.LIMIT and order.side == OrderSide.SELL)
+                else "ask >= entry (breakout)" if (order.kind == OrderKind.STOP and order.side == OrderSide.BUY)
+                else "bid <= entry (breakdown)"
+            )
+            title = (
+                f"Pending {order.kind.value.upper()} placed: "
+                f"{order.symbol} {order.side.value} {order.volume} @ {order.entry}"
+            )
+            body = (
+                f"Will auto-fill on MT5 when {trigger}.\n"
+                f"entry={order.entry}  sl={order.sl}  tp={order.tp}\n"
+                f"ticket={result.ticket}  comment={order.comment}\n"
+                f"Cancels at session-close, or with `cli cancel-pending --ticket {result.ticket}`."
+            )
+        notify.info(title=title, body=body)
     else:
         notify.warn(
             title=f"Broker rejected order: {order.symbol}",
