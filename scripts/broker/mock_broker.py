@@ -228,6 +228,43 @@ class MockBroker:
                 return True
         return False
 
+    def partial_close_position(self, ticket: int, volume_to_close: float) -> bool:
+        if volume_to_close <= 0:
+            return False
+        for i, p in enumerate(self._state.positions):
+            if p.ticket != ticket:
+                continue
+            # Cap close volume at the open position volume
+            close_vol = min(volume_to_close, p.volume)
+            if close_vol >= p.volume - 1e-9:
+                # Full close
+                self._balance += p.profit
+                self._state.closed_positions.append(p)
+                self._state.positions.pop(i)
+                return True
+            # Partial: realize the proportional P/L, reduce volume
+            fraction = close_vol / p.volume
+            realized = p.profit * fraction
+            self._balance += realized
+            remaining_vol = p.volume - close_vol
+            new_profit = p.profit - realized
+            self._state.positions[i] = Position(
+                ticket=p.ticket, symbol=p.symbol, side=p.side, volume=remaining_vol,
+                price_open=p.price_open, price_current=p.price_current,
+                sl=p.sl, tp=p.tp, profit=round(new_profit, 2), swap=p.swap,
+                time_open=p.time_open, comment=p.comment, magic=p.magic,
+            )
+            # Record the partial slice in closed history for stats
+            partial = Position(
+                ticket=p.ticket, symbol=p.symbol, side=p.side, volume=close_vol,
+                price_open=p.price_open, price_current=p.price_current,
+                sl=p.sl, tp=p.tp, profit=round(realized, 2), swap=0.0,
+                time_open=p.time_open, comment=f"{p.comment}|partial", magic=p.magic,
+            )
+            self._state.closed_positions.append(partial)
+            return True
+        return False
+
     def rates(self, symbol: str, tf: Timeframe, count: int) -> list[Bar]:
         """Return flat bars at current price. Good enough for smoke tests."""
         if symbol not in self._prices:

@@ -18,7 +18,7 @@ import os
 import sys
 from dataclasses import asdict
 
-from . import decide, journal, notify, research, sessions, stats, trade
+from . import decide, journal, management, notify, research, sessions, stats, trade
 from .account import append_snapshot, snapshot
 from .broker import get_broker
 
@@ -131,6 +131,25 @@ def cmd_cancel_pending(args: argparse.Namespace) -> int:
     finally:
         broker.disconnect()
     print(f"Cancelled {len(cancelled)} pending orders: {cancelled}")
+    return 0
+
+
+def cmd_manage_runners(args: argparse.Namespace) -> int:
+    broker = get_broker()
+    broker.connect()
+    try:
+        report = management.manage_runners(broker)
+    finally:
+        broker.disconnect()
+    if args.json:
+        print(json.dumps(asdict(report), indent=2))
+    else:
+        print(
+            f"Managed {report.positions_touched} positions: "
+            f"{report.breakevens_moved} to BE, "
+            f"{report.partials_taken} partials, "
+            f"{report.trails_updated} trails"
+        )
     return 0
 
 
@@ -250,6 +269,13 @@ def build_parser() -> argparse.ArgumentParser:
     be = sub.add_parser("breakeven")
     be.add_argument("--min-r", type=float, default=1.0, dest="min_r")
     be.set_defaults(func=cmd_breakeven)
+
+    mr = sub.add_parser(
+        "manage-runners",
+        help="Active trade management: breakeven, partial TPs, trailing SL",
+    )
+    mr.add_argument("--json", action="store_true")
+    mr.set_defaults(func=cmd_manage_runners)
 
     pd = sub.add_parser("pending", help="List pending (unfilled) orders")
     pd.add_argument("--json", action="store_true")
